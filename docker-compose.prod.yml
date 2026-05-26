@@ -1,0 +1,5 @@
+version: "3.8"
+# Production compose — customize for cloud or local prod as needed.
+# This file is intentionally minimal; extend per deployment requirements.
+
+services: {}
