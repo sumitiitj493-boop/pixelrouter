@@ -6,19 +6,15 @@
 #   1. Read metrics for all processors from Redis
 #   2. Sort by pending_jobs (ascending)
 #   3. Use CPU% as tiebreaker
-#   4. If all processors are above MAX_CPU_THRESHOLD, request autoscale
 #
 # Race condition protection:
 #   - threading.Lock() on the pending job counter
 #   - Redis INCRBY for atomic counter updates
 
-import os
 import threading
 from urllib.parse import urlparse
 
 METRICS_TTL_SECONDS = 10
-AUTOSCALE_REQUEST_TTL_SECONDS = 60
-MAX_CPU_THRESHOLD = float(os.getenv("MAX_CPU_THRESHOLD", "80"))
 
 _lock = threading.Lock()
 
@@ -49,6 +45,8 @@ def _parse_float(value):
 def select_processor(processor_urls: list, redis_client) -> str:
     """
     Returns the URL of the best processor to handle the next job.
+    This function has no scaling side effects; app.py owns endpoint flow,
+    overload handling, and fallback decisions.
     Routing order:
       1. Skip processors without live CPU metrics
       2. Pick the processor with the fewest pending jobs
@@ -78,12 +76,6 @@ def select_processor(processor_urls: list, redis_client) -> str:
 
     if not candidates:
         raise ValueError("No live processors available for routing")
-
-    if all(
-        candidate["cpu_percent"] >= MAX_CPU_THRESHOLD
-        for candidate in candidates
-    ):
-        trigger_autoscale(redis_client)
 
     selected = min(
         candidates,
@@ -116,16 +108,3 @@ def update_pending_count(processor_id: str, delta: int, redis_client):
             redis_client.expire(pending_key, METRICS_TTL_SECONDS)
 
         return new_count
-
-
-def trigger_autoscale(redis_client):
-    """
-    Mark that autoscaling should be requested.
-    Actual Docker SDK / Cloud Run scaling remains a future deployment step.
-    """
-    return redis_client.set(
-        "autoscale:requested",
-        "1",
-        ex=AUTOSCALE_REQUEST_TTL_SECONDS,
-        nx=True
-    )

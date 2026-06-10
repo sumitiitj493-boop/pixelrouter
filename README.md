@@ -50,6 +50,21 @@ Then open `http://localhost:8501`.
   `autoscale:requested` Redis flag. Actual Docker SDK / Cloud Run scaling is
   still planned.
 
+## Load Balancer Config
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `REDIS_URL` | `redis://redis:6379` | Redis connection used for metrics and routing state |
+| `PROCESSOR_URLS` | `http://processor-1:8002,http://processor-2:8003` | Initial local processor pool |
+| `MAX_CPU_THRESHOLD` | `80` | CPU percentage where a live processor is considered overloaded |
+| `METRICS_REFRESH_TIMEOUT_SECONDS` | `2` | Timeout for polling each processor's `/metrics` endpoint |
+| `LOCAL_AUTOSCALE_ENABLED` | `true` | Feature flag for future Docker SDK local autoscaling |
+| `MAX_PROCESSORS` | `5` | Maximum local processor containers allowed |
+| `PROCESSOR_BASE_PORT` | `8002` | First local processor port for dynamic processor naming/ports |
+| `PROCESSOR_IMAGE` | `pixelrouter-processor:latest` | Docker image future autoscaling should launch |
+| `PROCESSOR_NETWORK` | `pixelrouter_pixelrouter-network` | Docker network future autoscaled processors should join |
+| `CLOUD_RUN_PROCESSOR_URL` | empty | Cloud Run processor fallback endpoint |
+
 ## Key Features
 
 - CPU-aware load balancer routing based on live processor utilization

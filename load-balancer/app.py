@@ -6,7 +6,8 @@
 from fastapi import FastAPI, HTTPException
 import httpx
 import redis
-import os
+
+from config import get_settings
 
 from router import (
     processor_id_from_url,
@@ -19,18 +20,10 @@ app = FastAPI(
     version="0.1.0"
 )
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
-PROCESSOR_URLS = [
-    url.strip()
-    for url in os.getenv(
-        "PROCESSOR_URLS",
-        "http://processor-1:8002,http://processor-2:8003"
-    ).split(",")
-    if url.strip()
-]
-MAX_CPU_THRESHOLD = int(os.getenv("MAX_CPU_THRESHOLD", "80"))
+settings = get_settings()
+AUTOSCALE_REQUEST_TTL_SECONDS = 60
 
-r = redis.from_url(REDIS_URL, decode_responses=True)
+r = redis.from_url(settings.redis_url, decode_responses=True)
 
 
 @app.get("/")
@@ -38,7 +31,7 @@ async def root():
     return {
         "service": "load-balancer",
         "version": "0.1.0",
-        "processors_registered": len(PROCESSOR_URLS)
+        "processors_registered": len(settings.processor_urls)
     }
 
 
@@ -52,13 +45,94 @@ async def refresh_processor_metrics():
     Ask each processor for fresh metrics before routing.
     Processor /metrics also writes those values to Redis with a short TTL.
     """
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for processor_url in PROCESSOR_URLS:
+    async with httpx.AsyncClient(
+        timeout=settings.metrics_refresh_timeout_seconds
+    ) as client:
+        for processor_url in settings.processor_urls:
             try:
                 response = await client.get(f"{processor_url}/metrics")
                 response.raise_for_status()
             except httpx.HTTPError:
                 continue
+
+
+def _parse_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_live_processor_metrics(processor_urls: list[str], redis_client):
+    """
+    Read the live processor snapshot app.py needs for scaling decisions.
+    Routing itself remains delegated to router.py.
+    """
+    live_processors = []
+
+    for processor_url in processor_urls:
+        processor_id = processor_id_from_url(processor_url)
+        cpu_percent = _parse_float(
+            redis_client.get(f"metrics:{processor_id}:cpu")
+        )
+
+        if cpu_percent is None:
+            continue
+
+        pending_jobs = _parse_int(
+            redis_client.get(f"metrics:{processor_id}:pending")
+        )
+        live_processors.append({
+            "processor_id": processor_id,
+            "url": processor_url,
+            "cpu_percent": cpu_percent,
+            "pending_jobs": max(0, pending_jobs)
+        })
+
+    return live_processors
+
+
+def all_live_processors_overloaded(live_processors: list[dict]) -> bool:
+    if not live_processors:
+        return False
+
+    return all(
+        processor["cpu_percent"] >= settings.max_cpu_threshold
+        for processor in live_processors
+    )
+
+
+def request_local_autoscale(redis_client):
+    """
+    Record an autoscale request; the Docker SDK manager will consume this later.
+    """
+    return redis_client.set(
+        "autoscale:requested",
+        "1",
+        ex=AUTOSCALE_REQUEST_TTL_SECONDS,
+        nx=True
+    )
+
+
+def decide_scaling_action(live_processors: list[dict], redis_client) -> str:
+    if not all_live_processors_overloaded(live_processors):
+        return "none"
+
+    if settings.local_autoscale_enabled:
+        request_local_autoscale(redis_client)
+        return "local_autoscale_requested"
+
+    if settings.cloud_fallback_enabled:
+        return "cloud_fallback_available"
+
+    return "overloaded_no_fallback_configured"
 
 
 @app.get("/route")
@@ -70,9 +144,10 @@ async def get_best_processor():
     after the selected processor actually accepts/claims the job.
     """
     await refresh_processor_metrics()
+    live_processors = get_live_processor_metrics(settings.processor_urls, r)
 
     try:
-        processor_url = select_processor(PROCESSOR_URLS, r)
+        processor_url = select_processor(settings.processor_urls, r)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -81,6 +156,7 @@ async def get_best_processor():
     return {
         "processor_url": processor_url,
         "processor_id": processor_id,
+        "scaling_action": decide_scaling_action(live_processors, r),
         "reason": "selected by lowest pending_jobs, then lowest CPU usage"
     }
 
@@ -92,7 +168,7 @@ async def processors_status():
     Reads from Redis metrics keys written by each processor.
     """
     statuses = []
-    for url in PROCESSOR_URLS:
+    for url in settings.processor_urls:
         processor_id = processor_id_from_url(url)
         cpu = r.get(f"metrics:{processor_id}:cpu") or "unknown"
         pending = r.get(f"metrics:{processor_id}:pending") or "0"
@@ -104,5 +180,8 @@ async def processors_status():
         })
     return {
         "processors": statuses,
-        "max_cpu_threshold": MAX_CPU_THRESHOLD
+        "max_cpu_threshold": settings.max_cpu_threshold,
+        "local_autoscale_enabled": settings.local_autoscale_enabled,
+        "max_processors": settings.max_processors,
+        "cloud_fallback_enabled": settings.cloud_fallback_enabled
     }

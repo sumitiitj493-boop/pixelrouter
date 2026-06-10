@@ -97,7 +97,7 @@ def test_select_processor_ignores_processors_without_live_cpu_metrics():
     assert selected == "http://processor-2:8003"
 
 
-def test_select_processor_requests_autoscale_when_all_processors_overloaded():
+def test_select_processor_has_no_autoscale_side_effect():
     redis_client = FakeRedis({
         "metrics:processor-1:cpu": "90",
         "metrics:processor-1:pending": "1",
@@ -108,7 +108,7 @@ def test_select_processor_requests_autoscale_when_all_processors_overloaded():
     selected = select_processor(PROCESSORS, redis_client)
 
     assert selected == "http://processor-1:8002"
-    assert redis_client.values["autoscale:requested"] == "1"
+    assert "autoscale:requested" not in redis_client.values
 
 
 def test_update_pending_count_increments_and_clamps_to_zero():
