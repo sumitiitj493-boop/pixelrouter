@@ -39,6 +39,11 @@ Then open `http://localhost:8501`.
 
 - Reads live processor metrics from Redis keys like `metrics:processor-1:cpu`
   and `metrics:processor-1:pending`.
+- Maintains a Redis processor registry with processor ID, URL, type, status,
+  creation time, and last metrics timestamp.
+- Bootstraps the registry from `PROCESSOR_URLS` and optional
+  `CLOUD_RUN_PROCESSOR_URL`, so future autoscaled processors can join the same
+  routing path.
 - Ignores processors that do not have live CPU metrics, treating them as offline.
 - Selects the processor with the lowest pending job count; CPU percentage is the
   tiebreaker.
@@ -85,6 +90,7 @@ Under active development.
 
 - [x] Project scaffolded
 - [x] Load balancer CPU-aware router selection
+- [x] Redis-backed processor registry
 - [x] Thread-safe pending count helper
 - [x] Autoscale request signal
 - [ ] Processor job claim flow increments/decrements pending counts

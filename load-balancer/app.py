@@ -8,6 +8,13 @@ import httpx
 import redis
 
 from config import get_settings
+from registry import (
+    bootstrap_processor_registry,
+    get_processor_urls,
+    get_processors,
+    mark_processor_metrics_seen,
+    mark_processor_unreachable,
+)
 
 from router import (
     processor_id_from_url,
@@ -26,12 +33,28 @@ AUTOSCALE_REQUEST_TTL_SECONDS = 60
 r = redis.from_url(settings.redis_url, decode_responses=True)
 
 
+def ensure_processor_registry():
+    bootstrap_processor_registry(
+        r,
+        local_processor_urls=settings.processor_urls,
+        cloud_processor_url=settings.cloud_run_processor_url,
+    )
+
+
+@app.on_event("startup")
+async def startup():
+    ensure_processor_registry()
+
+
 @app.get("/")
 async def root():
+    ensure_processor_registry()
+    processors = get_processors(r)
+
     return {
         "service": "load-balancer",
         "version": "0.1.0",
-        "processors_registered": len(settings.processor_urls)
+        "processors_registered": len(processors)
     }
 
 
@@ -40,7 +63,7 @@ async def health():
     return {"status": "ok", "service": "load-balancer"}
 
 
-async def refresh_processor_metrics():
+async def refresh_processor_metrics(processor_urls: list[str]):
     """
     Ask each processor for fresh metrics before routing.
     Processor /metrics also writes those values to Redis with a short TTL.
@@ -48,11 +71,14 @@ async def refresh_processor_metrics():
     async with httpx.AsyncClient(
         timeout=settings.metrics_refresh_timeout_seconds
     ) as client:
-        for processor_url in settings.processor_urls:
+        for processor_url in processor_urls:
+            processor_id = processor_id_from_url(processor_url)
             try:
                 response = await client.get(f"{processor_url}/metrics")
                 response.raise_for_status()
+                mark_processor_metrics_seen(r, processor_id)
             except httpx.HTTPError:
+                mark_processor_unreachable(r, processor_id)
                 continue
 
 
@@ -143,11 +169,22 @@ async def get_best_processor():
     Pending count is not incremented here; it should be updated only
     after the selected processor actually accepts/claims the job.
     """
-    await refresh_processor_metrics()
-    live_processors = get_live_processor_metrics(settings.processor_urls, r)
+    ensure_processor_registry()
+    processor_urls = get_processor_urls(
+        r,
+        processor_type="local",
+        statuses={"active", "unreachable"},
+    )
+    await refresh_processor_metrics(processor_urls)
+    processor_urls = get_processor_urls(
+        r,
+        processor_type="local",
+        statuses={"active"},
+    )
+    live_processors = get_live_processor_metrics(processor_urls, r)
 
     try:
-        processor_url = select_processor(settings.processor_urls, r)
+        processor_url = select_processor(processor_urls, r)
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -167,14 +204,20 @@ async def processors_status():
     Returns current metrics for all registered processors.
     Reads from Redis metrics keys written by each processor.
     """
+    ensure_processor_registry()
     statuses = []
-    for url in settings.processor_urls:
+    for processor in get_processors(r):
+        url = processor.get("url")
         processor_id = processor_id_from_url(url)
         cpu = r.get(f"metrics:{processor_id}:cpu") or "unknown"
         pending = r.get(f"metrics:{processor_id}:pending") or "0"
         statuses.append({
             "processor_id": processor_id,
             "url": url,
+            "type": processor.get("type"),
+            "status": processor.get("status"),
+            "created_at": processor.get("created_at"),
+            "last_metrics_at": processor.get("last_metrics_at"),
             "cpu_percent": cpu,
             "pending_jobs": pending
         })
