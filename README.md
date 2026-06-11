@@ -44,7 +44,13 @@ Then open `http://localhost:8501`.
 - Bootstraps the registry from `PROCESSOR_URLS` and optional
   `CLOUD_RUN_PROCESSOR_URL`, so future autoscaled processors can join the same
   routing path.
-- Ignores processors that do not have live CPU metrics, treating them as offline.
+- Refreshes registered local processors before routing and marks failed metric
+  polls as `stale`.
+- Excludes Cloud Run from normal metric refresh until cloud fallback is used.
+- Ignores processors that do not have live CPU metrics.
+- Detects overload only across live local processors. If at least one live local
+  processor is below `MAX_CPU_THRESHOLD`, routing stays local and no scaling is
+  requested.
 - Selects the processor with the lowest pending job count; CPU percentage is the
   tiebreaker.
 - Does not increment `pending_jobs` when `/route` is called. Pending count should

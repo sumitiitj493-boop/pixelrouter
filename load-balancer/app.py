@@ -13,7 +13,7 @@ from registry import (
     get_processor_urls,
     get_processors,
     mark_processor_metrics_seen,
-    mark_processor_unreachable,
+    mark_processor_stale,
 )
 
 from router import (
@@ -78,7 +78,7 @@ async def refresh_processor_metrics(processor_urls: list[str]):
                 response.raise_for_status()
                 mark_processor_metrics_seen(r, processor_id)
             except httpx.HTTPError:
-                mark_processor_unreachable(r, processor_id)
+                mark_processor_stale(r, processor_id)
                 continue
 
 
@@ -135,6 +135,23 @@ def all_live_processors_overloaded(live_processors: list[dict]) -> bool:
     )
 
 
+def has_healthy_local_capacity(live_processors: list[dict]) -> bool:
+    return any(
+        processor["cpu_percent"] < settings.max_cpu_threshold
+        for processor in live_processors
+    )
+
+
+def get_local_capacity_state(live_processors: list[dict]) -> str:
+    if not live_processors:
+        return "no_live_local_processors"
+
+    if all_live_processors_overloaded(live_processors):
+        return "overloaded"
+
+    return "healthy"
+
+
 def request_local_autoscale(redis_client):
     """
     Record an autoscale request; the Docker SDK manager will consume this later.
@@ -148,7 +165,7 @@ def request_local_autoscale(redis_client):
 
 
 def decide_scaling_action(live_processors: list[dict], redis_client) -> str:
-    if not all_live_processors_overloaded(live_processors):
+    if get_local_capacity_state(live_processors) != "overloaded":
         return "none"
 
     if settings.local_autoscale_enabled:
@@ -173,7 +190,7 @@ async def get_best_processor():
     processor_urls = get_processor_urls(
         r,
         processor_type="local",
-        statuses={"active", "unreachable"},
+        statuses={"active", "stale"},
     )
     await refresh_processor_metrics(processor_urls)
     processor_urls = get_processor_urls(
@@ -193,6 +210,7 @@ async def get_best_processor():
     return {
         "processor_url": processor_url,
         "processor_id": processor_id,
+        "local_capacity_state": get_local_capacity_state(live_processors),
         "scaling_action": decide_scaling_action(live_processors, r),
         "reason": "selected by lowest pending_jobs, then lowest CPU usage"
     }

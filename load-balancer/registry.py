@@ -107,7 +107,7 @@ def mark_processor_metrics_seen(redis_client, processor_id: str):
     })
 
 
-def mark_processor_unreachable(redis_client, processor_id: str):
+def mark_processor_stale(redis_client, processor_id: str):
     redis_client.hset(processor_key(processor_id), mapping={
-        "status": "unreachable",
+        "status": "stale",
     })
