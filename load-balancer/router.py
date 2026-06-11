@@ -56,6 +56,8 @@ def select_processor(processor_urls: list, redis_client) -> str:
 
     for processor_url in processor_urls:
         processor_id = processor_id_from_url(processor_url)
+        # Missing CPU metrics means the processor is not considered healthy
+        # enough for routing, even if the registry still lists it as active.
         cpu_percent = _parse_float(
             redis_client.get(f"metrics:{processor_id}:cpu")
         )
@@ -77,6 +79,8 @@ def select_processor(processor_urls: list, redis_client) -> str:
     if not candidates:
         raise ValueError("No live processors available for routing")
 
+    # Prefer spare queue capacity first; CPU is only a tie-breaker to avoid
+    # repeatedly pushing work onto the same instance when load is even.
     selected = min(
         candidates,
         key=lambda candidate: (
@@ -93,6 +97,8 @@ def update_pending_count(processor_id: str, delta: int, redis_client):
     Thread-safe update of pending job count for a processor.
     delta = +1 when job assigned, -1 when job completes.
     """
+    # Serialize local updates so concurrent claim/complete events keep the
+    # Redis-backed counter aligned with the actual queue depth.
     with _lock:
         pending_key = f"metrics:{processor_id}:pending"
         new_count = redis_client.incrby(pending_key, delta)

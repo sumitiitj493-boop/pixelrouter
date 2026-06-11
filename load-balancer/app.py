@@ -68,6 +68,8 @@ async def refresh_processor_metrics(processor_urls: list[str]):
     Ask each processor for fresh metrics before routing.
     Processor /metrics also writes those values to Redis with a short TTL.
     """
+    # The metrics request doubles as a liveness check; failed calls mark the
+    # processor stale so routing stops considering it for active traffic.
     async with httpx.AsyncClient(
         timeout=settings.metrics_refresh_timeout_seconds
     ) as client:
@@ -156,6 +158,8 @@ def decide_scaling_action(live_processors: list[dict], redis_client) -> str:
     if get_local_capacity_state(live_processors) != "overloaded":
         return "none"
 
+    # Prefer extending the local pool first; cloud fallback is reserved for
+    # cases where local autoscaling is unavailable or fully capped.
     if settings.local_autoscale_enabled:
         result = scale_local_processors(redis_client, settings)
         if result.scaled:
@@ -166,6 +170,117 @@ def decide_scaling_action(live_processors: list[dict], redis_client) -> str:
         return "cloud_fallback_available"
 
     return "overloaded_no_fallback_configured"
+
+
+def get_cloud_fallback_processor(redis_client):
+    cloud_processors = get_processors(
+        redis_client,
+        processor_type="cloud",
+        statuses={"active"},
+    )
+    if not cloud_processors:
+        return None
+    return cloud_processors[0]
+
+
+def build_route_response(
+    processor_url: str,
+    processor_id: str,
+    tier: str,
+    scaled: bool,
+    fallback_used: bool,
+    reason: str,
+    scaling_action: str,
+):
+    return {
+        "processor_url": processor_url,
+        "processor_id": processor_id,
+        "tier": tier,
+        "processor_type": tier,
+        "scaled": scaled,
+        "fallback_used": fallback_used,
+        "scaling_action": scaling_action,
+        "reason": reason,
+    }
+
+
+def maybe_scale_or_fallback(
+    live_processors: list[dict],
+    redis_client,
+    scale_fn=scale_local_processors,
+):
+    local_capacity_state = get_local_capacity_state(live_processors)
+
+    if local_capacity_state != "overloaded":
+        return {
+            "scaled": False,
+            "fallback_processor": None,
+            "scaling_action": "none",
+            "reason": "selected by lowest pending_jobs, then lowest CPU usage",
+        }
+
+    # Fallback only matters once the local pool is already saturated.
+    if not settings.local_autoscale_enabled:
+        return {
+            "scaled": False,
+            "fallback_processor": None,
+            "scaling_action": "local_autoscale_disabled",
+            "reason": "local processors overloaded but autoscaling is disabled",
+        }
+
+    scale_result = scale_fn(redis_client, settings)
+
+    if scale_result.scaled:
+        return {
+            "scaled": True,
+            "fallback_processor": None,
+            "scaling_action": f"local_scaled:{scale_result.processor_id}",
+            "reason": "local_overload_scaled_new_processor",
+        }
+
+    if scale_result.reason == "max_processors_reached":
+        cloud_processor = get_cloud_fallback_processor(redis_client)
+        if cloud_processor:
+            return {
+                "scaled": False,
+                "fallback_processor": cloud_processor,
+                "scaling_action": "max_processors_reached",
+                "reason": "cloud_fallback_max_local_capacity",
+            }
+
+    return {
+        "scaled": False,
+        "fallback_processor": None,
+        "scaling_action": scale_result.reason,
+        "reason": scale_result.reason,
+    }
+
+
+def build_scaling_status(redis_client):
+    local_processors = get_processors(redis_client, processor_type="local")
+    active_local_urls = get_processor_urls(
+        redis_client,
+        processor_type="local",
+        statuses={"active"},
+    )
+    live_processors = get_live_processor_metrics(
+        active_local_urls,
+        redis_client,
+    )
+    cloud_processor = get_cloud_fallback_processor(redis_client)
+
+    return {
+        "local_count": len(local_processors),
+        "max_processors": settings.max_processors,
+        "local_capacity_state": get_local_capacity_state(live_processors),
+        "local_autoscale_enabled": settings.local_autoscale_enabled,
+        "cloud_fallback_enabled": settings.cloud_fallback_enabled,
+        "cloud_fallback_configured": cloud_processor is not None,
+        "cloud_processor_url": (
+            cloud_processor.get("url") if cloud_processor else ""
+        ),
+        "max_cpu_threshold": settings.max_cpu_threshold,
+    }
 
 
 @app.get("/route")
@@ -189,6 +304,19 @@ async def get_best_processor():
         statuses={"active"},
     )
     live_processors = get_live_processor_metrics(processor_urls, r)
+    route_decision = maybe_scale_or_fallback(live_processors, r)
+
+    fallback_processor = route_decision["fallback_processor"]
+    if fallback_processor:
+        return build_route_response(
+            processor_url=fallback_processor["url"],
+            processor_id=fallback_processor["processor_id"],
+            tier="cloud",
+            scaled=route_decision["scaled"],
+            fallback_used=True,
+            reason=route_decision["reason"],
+            scaling_action=route_decision["scaling_action"],
+        )
 
     try:
         processor_url = select_processor(processor_urls, r)
@@ -197,13 +325,15 @@ async def get_best_processor():
 
     processor_id = processor_id_from_url(processor_url)
 
-    return {
-        "processor_url": processor_url,
-        "processor_id": processor_id,
-        "local_capacity_state": get_local_capacity_state(live_processors),
-        "scaling_action": decide_scaling_action(live_processors, r),
-        "reason": "selected by lowest pending_jobs, then lowest CPU usage"
-    }
+    return build_route_response(
+        processor_url=processor_url,
+        processor_id=processor_id,
+        tier="local",
+        scaled=route_decision["scaled"],
+        fallback_used=False,
+        reason=route_decision["reason"],
+        scaling_action=route_decision["scaling_action"],
+    )
 
 
 @app.get("/processors/status")
@@ -236,3 +366,12 @@ async def processors_status():
         "max_processors": settings.max_processors,
         "cloud_fallback_enabled": settings.cloud_fallback_enabled
     }
+
+
+@app.get("/scaling/status")
+async def scaling_status():
+    """
+    Exposes local scale limits and fallback readiness for dashboards.
+    """
+    ensure_processor_registry()
+    return build_scaling_status(r)

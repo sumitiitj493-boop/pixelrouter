@@ -61,6 +61,19 @@ Then open `http://localhost:8501`.
   autoscaler attempts to spawn one additional local processor.
 - Local autoscaling registers each new processor in Redis and stops at
   `MAX_PROCESSORS`.
+- If local capacity is still overloaded at `MAX_PROCESSORS`, `/route` falls
+  back to the configured Cloud Run processor and returns
+  `reason=cloud_fallback_max_local_capacity`.
+- `/route` returns routing metadata including `processor_url`, `processor_id`,
+  `tier`, `scaled`, `fallback_used`, `scaling_action`, and `reason`.
+
+## Load Balancer API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /route` | Refreshes local metrics, selects a local processor, scales locally, or returns Cloud Run fallback |
+| `GET /processors/status` | Lists registered local/cloud processors with status, CPU, pending jobs, and timestamps |
+| `GET /scaling/status` | Shows local count, max processor limit, overload state, and cloud fallback configuration |
 
 ## Load Balancer Config
 

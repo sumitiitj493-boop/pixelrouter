@@ -7,11 +7,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../load-balancer"))
 
 from app import (
     all_live_processors_overloaded,
+    build_route_response,
+    build_scaling_status,
     decide_scaling_action,
+    get_cloud_fallback_processor,
     get_local_capacity_state,
     has_healthy_local_capacity,
+    maybe_scale_or_fallback,
 )
-from autoscaler import scale_local_processors
+from autoscaler import AutoscaleResult, scale_local_processors
 from registry import (
     bootstrap_processor_registry,
     get_processor_urls,
@@ -260,6 +264,128 @@ def test_no_live_processors_are_not_treated_as_overloaded():
     assert has_healthy_local_capacity([]) is False
     assert get_local_capacity_state([]) == "no_live_local_processors"
     assert decide_scaling_action([], redis_client) == "none"
+
+
+def test_maybe_scale_or_fallback_uses_cloud_when_max_local_capacity_reached():
+    redis_client = FakeRedis()
+    bootstrap_processor_registry(
+        redis_client,
+        local_processor_urls=PROCESSORS,
+        cloud_processor_url="https://pixelrouter-cloud.run.app",
+    )
+    live_processors = [
+        {"processor_id": "processor-1", "cpu_percent": 95.0},
+        {"processor_id": "processor-2", "cpu_percent": 91.0},
+    ]
+
+    def fake_scale_fn(redis_client, settings):
+        return AutoscaleResult(
+            scaled=False,
+            reason="max_processors_reached",
+            local_count=5,
+            max_processors=5,
+        )
+
+    decision = maybe_scale_or_fallback(
+        live_processors,
+        redis_client,
+        scale_fn=fake_scale_fn,
+    )
+
+    assert decision["scaled"] is False
+    assert decision["fallback_processor"]["url"] == (
+        "https://pixelrouter-cloud.run.app"
+    )
+    assert decision["fallback_processor"]["type"] == "cloud"
+    assert decision["scaling_action"] == "max_processors_reached"
+    assert decision["reason"] == "cloud_fallback_max_local_capacity"
+
+
+def test_maybe_scale_or_fallback_reports_local_scale_success():
+    redis_client = FakeRedis()
+    live_processors = [
+        {"processor_id": "processor-1", "cpu_percent": 95.0},
+        {"processor_id": "processor-2", "cpu_percent": 91.0},
+    ]
+
+    def fake_scale_fn(redis_client, settings):
+        return AutoscaleResult(
+            scaled=True,
+            reason="processor_spawned",
+            local_count=3,
+            max_processors=5,
+            processor_id="processor-3",
+            processor_url="http://processor-3:8004",
+        )
+
+    decision = maybe_scale_or_fallback(
+        live_processors,
+        redis_client,
+        scale_fn=fake_scale_fn,
+    )
+
+    assert decision["scaled"] is True
+    assert decision["fallback_processor"] is None
+    assert decision["scaling_action"] == "local_scaled:processor-3"
+    assert decision["reason"] == "local_overload_scaled_new_processor"
+
+
+def test_build_route_response_includes_routing_metadata():
+    response = build_route_response(
+        processor_url="https://pixelrouter-cloud.run.app",
+        processor_id="pixelrouter-cloud.run.app",
+        tier="cloud",
+        scaled=False,
+        fallback_used=True,
+        reason="cloud_fallback_max_local_capacity",
+        scaling_action="max_processors_reached",
+    )
+
+    assert response == {
+        "processor_url": "https://pixelrouter-cloud.run.app",
+        "processor_id": "pixelrouter-cloud.run.app",
+        "tier": "cloud",
+        "processor_type": "cloud",
+        "scaled": False,
+        "fallback_used": True,
+        "scaling_action": "max_processors_reached",
+        "reason": "cloud_fallback_max_local_capacity",
+    }
+
+
+def test_build_scaling_status_reports_local_limit_and_cloud_config():
+    redis_client = FakeRedis({
+        "metrics:processor-1:cpu": "35",
+        "metrics:processor-1:pending": "1",
+    })
+    bootstrap_processor_registry(
+        redis_client,
+        local_processor_urls=PROCESSORS,
+        cloud_processor_url="https://pixelrouter-cloud.run.app",
+    )
+    mark_processor_stale(redis_client, "processor-2")
+
+    status = build_scaling_status(redis_client)
+
+    assert status["local_count"] == 2
+    assert status["max_processors"] == 5
+    assert status["local_capacity_state"] == "healthy"
+    assert status["cloud_fallback_configured"] is True
+    assert status["cloud_processor_url"] == "https://pixelrouter-cloud.run.app"
+
+
+def test_get_cloud_fallback_processor_returns_registered_cloud_processor():
+    redis_client = FakeRedis()
+    bootstrap_processor_registry(
+        redis_client,
+        local_processor_urls=PROCESSORS,
+        cloud_processor_url="https://pixelrouter-cloud.run.app",
+    )
+
+    processor = get_cloud_fallback_processor(redis_client)
+
+    assert processor["processor_id"] == "pixelrouter-cloud.run.app"
+    assert processor["url"] == "https://pixelrouter-cloud.run.app"
 
 
 def test_scale_local_processors_spawns_next_processor_and_registers_it():

@@ -1,4 +1,5 @@
 # PixelRouter - Docker Autoscaling Manager
+# Spawns new local processor containers when the registered pool reaches capacity.
 
 import os
 import re
@@ -44,6 +45,8 @@ def _processor_url(processor_id: str, port: int) -> str:
 
 
 def _container_environment(settings, processor_id: str, port: int) -> dict:
+    # Mirror the runtime configuration the processor expects so the new
+    # container behaves like the compose-managed instances.
     environment = {
         "REDIS_URL": settings.redis_url,
         "PROCESSOR_ID": processor_id,
@@ -77,9 +80,13 @@ def scale_local_processors(redis_client, settings, docker_client=None):
     processor_number = _next_processor_number(local_processors)
     processor_id = f"processor-{processor_number}"
     port = settings.processor_base_port + processor_number - 1
+    # Keep the container name, Redis identity, and host port aligned so the
+    # rest of the load balancer can treat the new instance as a first-class peer.
     processor_url = _processor_url(processor_id, port)
 
     if docker_client is None:
+        # Import Docker lazily so tests and non-autoscaling paths do not need
+        # the SDK unless a new local processor is actually being created.
         import docker
         docker_client = docker.from_env()
 
@@ -103,6 +110,8 @@ def scale_local_processors(redis_client, settings, docker_client=None):
             processor_url=processor_url,
         )
 
+    # Register the container only after it starts successfully so routing does
+    # not point traffic at an instance that never came up.
     register_processor(
         redis_client,
         processor_id=processor_id,
