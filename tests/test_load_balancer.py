@@ -2,9 +2,68 @@
 
 import os
 import sys
+import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../load-balancer"))
 
+if "fastapi" not in sys.modules:
+    fastapi_stub = types.ModuleType("fastapi")
+
+    class FastAPI:  # pragma: no cover - test import shim
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, *args, **kwargs):
+            def decorator(handler):
+                return handler
+
+            return decorator
+
+        def on_event(self, *args, **kwargs):
+            def decorator(handler):
+                return handler
+
+            return decorator
+
+    class HTTPException(Exception):  # pragma: no cover - test import shim
+        def __init__(self, status_code, detail):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    fastapi_stub.FastAPI = FastAPI
+    fastapi_stub.HTTPException = HTTPException
+    sys.modules["fastapi"] = fastapi_stub
+
+if "httpx" not in sys.modules:
+    httpx_stub = types.ModuleType("httpx")
+
+    class HTTPError(Exception):  # pragma: no cover - test import shim
+        pass
+
+    class AsyncClient:  # pragma: no cover - test import shim
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, *args, **kwargs):
+            raise HTTPError("httpx is not installed in this test environment")
+
+    httpx_stub.AsyncClient = AsyncClient
+    httpx_stub.HTTPError = HTTPError
+    sys.modules["httpx"] = httpx_stub
+
+if "redis" not in sys.modules:
+    redis_stub = types.ModuleType("redis")
+    redis_stub.from_url = lambda *args, **kwargs: object()
+    sys.modules["redis"] = redis_stub
+
+import app as load_balancer_app
 from app import (
     all_live_processors_overloaded,
     build_route_response,
@@ -87,6 +146,9 @@ class FakeSettings:
     processor_base_port = 8002
     processor_image = "pixelrouter-processor:latest"
     processor_network = "pixelrouter_pixelrouter-network"
+    max_cpu_threshold = 80.0
+    local_autoscale_enabled = True
+    cloud_run_processor_url = ""
 
 
 class FakeContainers:
@@ -257,6 +319,98 @@ def test_one_healthy_local_processor_prevents_scaling():
     assert "autoscale:requested" not in redis_client.values
 
 
+def test_normal_routing_stays_on_local_processors_without_scaling():
+    original_settings = load_balancer_app.settings
+    load_balancer_app.settings = FakeSettings
+    try:
+        redis_client = FakeRedis({
+            "metrics:processor-1:cpu": "30",
+            "metrics:processor-1:pending": "4",
+            "metrics:processor-2:cpu": "20",
+            "metrics:processor-2:pending": "1",
+        })
+        live_processors = [
+            {"processor_id": "processor-1", "cpu_percent": 30.0},
+            {"processor_id": "processor-2", "cpu_percent": 20.0},
+        ]
+
+        decision = maybe_scale_or_fallback(live_processors, redis_client)
+        selected = select_processor(PROCESSORS, redis_client)
+
+        assert decision["scaled"] is False
+        assert decision["fallback_processor"] is None
+        assert decision["scaling_action"] == "none"
+        assert selected == "http://processor-2:8003"
+    finally:
+        load_balancer_app.settings = original_settings
+
+
+def test_local_scaling_triggers_when_all_live_processors_are_overloaded():
+    original_settings = load_balancer_app.settings
+    load_balancer_app.settings = FakeSettings
+    try:
+        redis_client = FakeRedis()
+        live_processors = [
+            {"processor_id": "processor-1", "cpu_percent": 95.0},
+            {"processor_id": "processor-2", "cpu_percent": 91.0},
+        ]
+
+        def fake_scale_fn(redis_client, settings):
+            return AutoscaleResult(
+                scaled=True,
+                reason="processor_spawned",
+                local_count=3,
+                max_processors=5,
+                processor_id="processor-3",
+                processor_url="http://processor-3:8004",
+            )
+
+        decision = maybe_scale_or_fallback(
+            live_processors,
+            redis_client,
+            scale_fn=fake_scale_fn,
+        )
+
+        assert decision["scaled"] is True
+        assert decision["fallback_processor"] is None
+        assert decision["scaling_action"] == "local_scaled:processor-3"
+        assert decision["reason"] == "local_overload_scaled_new_processor"
+    finally:
+        load_balancer_app.settings = original_settings
+
+
+def test_no_scaling_occurs_when_local_capacity_is_already_at_max():
+    original_settings = load_balancer_app.settings
+    load_balancer_app.settings = FakeSettings
+    try:
+        redis_client = FakeRedis()
+        live_processors = [
+            {"processor_id": "processor-1", "cpu_percent": 95.0},
+            {"processor_id": "processor-2", "cpu_percent": 91.0},
+        ]
+
+        def fake_scale_fn(redis_client, settings):
+            return AutoscaleResult(
+                scaled=False,
+                reason="max_processors_reached",
+                local_count=5,
+                max_processors=5,
+            )
+
+        decision = maybe_scale_or_fallback(
+            live_processors,
+            redis_client,
+            scale_fn=fake_scale_fn,
+        )
+
+        assert decision["scaled"] is False
+        assert decision["fallback_processor"] is None
+        assert decision["scaling_action"] == "max_processors_reached"
+        assert decision["reason"] == "max_processors_reached"
+    finally:
+        load_balancer_app.settings = original_settings
+
+
 def test_no_live_processors_are_not_treated_as_overloaded():
     redis_client = FakeRedis()
 
@@ -267,67 +421,98 @@ def test_no_live_processors_are_not_treated_as_overloaded():
 
 
 def test_maybe_scale_or_fallback_uses_cloud_when_max_local_capacity_reached():
-    redis_client = FakeRedis()
-    bootstrap_processor_registry(
-        redis_client,
-        local_processor_urls=PROCESSORS,
-        cloud_processor_url="https://pixelrouter-cloud.run.app",
-    )
-    live_processors = [
-        {"processor_id": "processor-1", "cpu_percent": 95.0},
-        {"processor_id": "processor-2", "cpu_percent": 91.0},
-    ]
+    original_settings = load_balancer_app.settings
+    load_balancer_app.settings = FakeSettings
+    try:
+        redis_client = FakeRedis()
+        bootstrap_processor_registry(
+            redis_client,
+            local_processor_urls=PROCESSORS,
+            cloud_processor_url="https://pixelrouter-cloud.run.app",
+        )
+        live_processors = [
+            {"processor_id": "processor-1", "cpu_percent": 95.0},
+            {"processor_id": "processor-2", "cpu_percent": 91.0},
+        ]
 
-    def fake_scale_fn(redis_client, settings):
-        return AutoscaleResult(
-            scaled=False,
-            reason="max_processors_reached",
-            local_count=5,
-            max_processors=5,
+        def fake_scale_fn(redis_client, settings):
+            return AutoscaleResult(
+                scaled=False,
+                reason="max_processors_reached",
+                local_count=5,
+                max_processors=5,
+            )
+
+        decision = maybe_scale_or_fallback(
+            live_processors,
+            redis_client,
+            scale_fn=fake_scale_fn,
         )
 
-    decision = maybe_scale_or_fallback(
-        live_processors,
-        redis_client,
-        scale_fn=fake_scale_fn,
-    )
-
-    assert decision["scaled"] is False
-    assert decision["fallback_processor"]["url"] == (
-        "https://pixelrouter-cloud.run.app"
-    )
-    assert decision["fallback_processor"]["type"] == "cloud"
-    assert decision["scaling_action"] == "max_processors_reached"
-    assert decision["reason"] == "cloud_fallback_max_local_capacity"
+        assert decision["scaled"] is False
+        assert decision["fallback_processor"]["url"] == (
+            "https://pixelrouter-cloud.run.app"
+        )
+        assert decision["fallback_processor"]["type"] == "cloud"
+        assert decision["scaling_action"] == "max_processors_reached"
+        assert decision["reason"] == "cloud_fallback_max_local_capacity"
+    finally:
+        load_balancer_app.settings = original_settings
 
 
 def test_maybe_scale_or_fallback_reports_local_scale_success():
-    redis_client = FakeRedis()
-    live_processors = [
-        {"processor_id": "processor-1", "cpu_percent": 95.0},
-        {"processor_id": "processor-2", "cpu_percent": 91.0},
-    ]
+    original_settings = load_balancer_app.settings
+    load_balancer_app.settings = FakeSettings
+    try:
+        redis_client = FakeRedis()
+        live_processors = [
+            {"processor_id": "processor-1", "cpu_percent": 95.0},
+            {"processor_id": "processor-2", "cpu_percent": 91.0},
+        ]
 
-    def fake_scale_fn(redis_client, settings):
-        return AutoscaleResult(
-            scaled=True,
-            reason="processor_spawned",
-            local_count=3,
-            max_processors=5,
-            processor_id="processor-3",
-            processor_url="http://processor-3:8004",
+        def fake_scale_fn(redis_client, settings):
+            return AutoscaleResult(
+                scaled=True,
+                reason="processor_spawned",
+                local_count=3,
+                max_processors=5,
+                processor_id="processor-3",
+                processor_url="http://processor-3:8004",
+            )
+
+        decision = maybe_scale_or_fallback(
+            live_processors,
+            redis_client,
+            scale_fn=fake_scale_fn,
         )
 
-    decision = maybe_scale_or_fallback(
-        live_processors,
-        redis_client,
-        scale_fn=fake_scale_fn,
-    )
+        assert decision["scaled"] is True
+        assert decision["fallback_processor"] is None
+        assert decision["scaling_action"] == "local_scaled:processor-3"
+        assert decision["reason"] == "local_overload_scaled_new_processor"
+    finally:
+        load_balancer_app.settings = original_settings
 
-    assert decision["scaled"] is True
-    assert decision["fallback_processor"] is None
-    assert decision["scaling_action"] == "local_scaled:processor-3"
-    assert decision["reason"] == "local_overload_scaled_new_processor"
+
+def test_stale_processor_is_ignored_by_routing():
+    redis_client = FakeRedis()
+    bootstrap_processor_registry(redis_client, PROCESSORS)
+    mark_processor_stale(redis_client, "processor-1")
+
+    redis_client.set("metrics:processor-1:cpu", "5")
+    redis_client.set("metrics:processor-1:pending", "0")
+    redis_client.set("metrics:processor-2:cpu", "55")
+    redis_client.set("metrics:processor-2:pending", "3")
+
+    active_urls = get_processor_urls(
+        redis_client,
+        processor_type="local",
+        statuses={"active"},
+    )
+    selected = select_processor(active_urls, redis_client)
+
+    assert active_urls == ["http://processor-2:8003"]
+    assert selected == "http://processor-2:8003"
 
 
 def test_build_route_response_includes_routing_metadata():

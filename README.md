@@ -66,6 +66,10 @@ Then open `http://localhost:8501`.
   `reason=cloud_fallback_max_local_capacity`.
 - `/route` returns routing metadata including `processor_url`, `processor_id`,
   `tier`, `scaled`, `fallback_used`, `scaling_action`, and `reason`.
+- Unit tests mock the Docker SDK and Redis so routing and autoscaling logic can
+  be exercised without the full container stack.
+- A separate Docker Compose smoke test path is reserved for validating real
+  processor registration and routing against running containers.
 
 ## Load Balancer API
 
@@ -125,6 +129,12 @@ Under active development.
 ```bash
 pip install -r requirements-dev.txt
 make test
+```
+
+For a real-container smoke pass after `docker compose up -d --build`, run:
+
+```bash
+make smoke-test
 ```
 
 Runtime dependencies are kept inside each service folder. The root
