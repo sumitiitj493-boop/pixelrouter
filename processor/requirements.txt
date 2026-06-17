@@ -4,7 +4,6 @@ websockets==12.0
 rembg==2.0.57
 Pillow==10.3.0
 transformers==4.41.2
-torch==2.3.0
 google-cloud-storage==2.16.0
 redis==5.0.4
 psutil==5.9.8
