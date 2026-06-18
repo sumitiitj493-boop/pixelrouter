@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     """
     # ── STARTUP ──────────────────────────────────────────────────────────
     logger = logging.getLogger("processor.startup")
-    logger.info("Loading BLIP-base model... (this takes 15–30 seconds)")
+    logger.info("Loading BLIP-base model...")
 
     # from_pretrained is synchronous and slow — offload to a thread
     # so we don't freeze the event loop during the 15–30s load time.
