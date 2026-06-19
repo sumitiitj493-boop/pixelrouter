@@ -12,7 +12,7 @@ and expose system health through a Streamlit dashboard.
 | Service | Port | Tech |
 |---------|------|------|
 | Upload Service | 8000 | FastAPI, Redis, GCS |
-| Load Balancer | 8001 | FastAPI, Redis, httpx, Docker SDK planned |
+| Load Balancer | 8001 | FastAPI, Redis, httpx, Docker SDK |
 | Processor (x2 local) | 8002, 8003 | FastAPI, rembg, BLIP, psutil |
 | Processor (GCP) | Cloud Run | Same image, cloud deployment planned |
 | Dashboard | 8501 | Streamlit, Plotly |
@@ -39,16 +39,60 @@ Then open `http://localhost:8501`.
 
 - Reads live processor metrics from Redis keys like `metrics:processor-1:cpu`
   and `metrics:processor-1:pending`.
-- Ignores processors that do not have live CPU metrics, treating them as offline.
+- Maintains a Redis processor registry with processor ID, URL, type, status,
+  creation time, and last metrics timestamp.
+- Bootstraps the registry from `PROCESSOR_URLS` and optional
+  `CLOUD_RUN_PROCESSOR_URL`, so future autoscaled processors can join the same
+  routing path.
+- Refreshes registered local processors before routing and marks failed metric
+  polls as `stale`.
+- Excludes Cloud Run from normal metric refresh until cloud fallback is used.
+- Ignores processors that do not have live CPU metrics.
+- Detects overload only across live local processors. If at least one live local
+  processor is below `MAX_CPU_THRESHOLD`, routing stays local and no scaling is
+  requested.
 - Selects the processor with the lowest pending job count; CPU percentage is the
   tiebreaker.
 - Does not increment `pending_jobs` when `/route` is called. Pending count should
   increase only after a processor actually accepts or claims the job.
 - Uses a thread-safe `update_pending_count()` helper with Redis `INCRBY`, clamps
   negative counts to `0`, and refreshes the metrics TTL.
-- If all live processors exceed `MAX_CPU_THRESHOLD`, sets an
-  `autoscale:requested` Redis flag. Actual Docker SDK / Cloud Run scaling is
-  still planned.
+- If all live local processors exceed `MAX_CPU_THRESHOLD`, the Docker
+  autoscaler attempts to spawn one additional local processor.
+- Local autoscaling registers each new processor in Redis and stops at
+  `MAX_PROCESSORS`.
+- If local capacity is still overloaded at `MAX_PROCESSORS`, `/route` falls
+  back to the configured Cloud Run processor and returns
+  `reason=cloud_fallback_max_local_capacity`.
+- `/route` returns routing metadata including `processor_url`, `processor_id`,
+  `tier`, `scaled`, `fallback_used`, `scaling_action`, and `reason`.
+- Unit tests mock the Docker SDK and Redis so routing and autoscaling logic can
+  be exercised without the full container stack.
+- A separate Docker Compose smoke test path is reserved for validating real
+  processor registration and routing against running containers.
+
+## Load Balancer API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /route` | Refreshes local metrics, selects a local processor, scales locally, or returns Cloud Run fallback |
+| `GET /processors/status` | Lists registered local/cloud processors with status, CPU, pending jobs, and timestamps |
+| `GET /scaling/status` | Shows local count, max processor limit, overload state, and cloud fallback configuration |
+
+## Load Balancer Config
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `REDIS_URL` | `redis://redis:6379` | Redis connection used for metrics and routing state |
+| `PROCESSOR_URLS` | `http://processor-1:8002,http://processor-2:8003` | Initial local processor pool |
+| `MAX_CPU_THRESHOLD` | `80` | CPU percentage where a live processor is considered overloaded |
+| `METRICS_REFRESH_TIMEOUT_SECONDS` | `2` | Timeout for polling each processor's `/metrics` endpoint |
+| `LOCAL_AUTOSCALE_ENABLED` | `true` | Feature flag for future Docker SDK local autoscaling |
+| `MAX_PROCESSORS` | `5` | Maximum local processor containers allowed |
+| `PROCESSOR_BASE_PORT` | `8002` | First local processor port for dynamic processor naming/ports |
+| `PROCESSOR_IMAGE` | `pixelrouter-processor:latest` | Docker image future autoscaling should launch |
+| `PROCESSOR_NETWORK` | `pixelrouter_pixelrouter-network` | Docker network future autoscaled processors should join |
+| `CLOUD_RUN_PROCESSOR_URL` | empty | Cloud Run processor fallback endpoint |
 
 ## Key Features
 
@@ -70,8 +114,10 @@ Under active development.
 
 - [x] Project scaffolded
 - [x] Load balancer CPU-aware router selection
+- [x] Redis-backed processor registry
 - [x] Thread-safe pending count helper
-- [x] Autoscale request signal
+- [x] Docker SDK local autoscaling manager
+- [x] MAX_PROCESSORS local scale limit
 - [ ] Processor job claim flow increments/decrements pending counts
 - [ ] Upload service file handling and GCS storage
 - [ ] Processor rembg + BLIP pipeline
@@ -83,6 +129,12 @@ Under active development.
 ```bash
 pip install -r requirements-dev.txt
 make test
+```
+
+For a real-container smoke pass after `docker compose up -d --build`, run:
+
+```bash
+make smoke-test
 ```
 
 Runtime dependencies are kept inside each service folder. The root

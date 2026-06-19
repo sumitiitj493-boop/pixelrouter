@@ -26,5 +26,5 @@ print('rembg model pre-downloaded successfully')"
 
 COPY . .
 EXPOSE 8002
-# Removed --reload for production
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8002"]
+# No --reload — this is a production image, files don't change at runtime.
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

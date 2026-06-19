@@ -22,6 +22,9 @@ clean:
 test:
 	pytest tests/ -v
 
+smoke-test:
+	RUN_DOCKER_SMOKE_TESTS=1 pytest tests/test_load_balancer_smoke.py -v
+
 restart-%:
 	docker compose restart $*
 
