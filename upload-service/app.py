@@ -3,18 +3,62 @@
 #                 ask load balancer which processor to use,
 #                 track job state in Redis
 
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from google.cloud import storage
 import httpx
 import redis
 import os
 import uuid
 import time
 
+
+@dataclass(frozen=True)
+class UploadServiceSettings:
+    """Configuration loaded once at startup from environment."""
+    redis_url: str
+    load_balancer_url: str
+    gcs_bucket_name: str
+    gcs_object_prefix: str
+
+    @staticmethod
+    def from_env() -> "UploadServiceSettings":
+        return UploadServiceSettings(
+            redis_url=os.getenv("REDIS_URL", "redis://redis:6379"),
+            load_balancer_url=os.getenv(
+                "LOAD_BALANCER_URL",
+                "http://load-balancer:8001"
+            ),
+            gcs_bucket_name=os.getenv(
+                "GCS_BUCKET_NAME",
+                "pixelrouter-images"
+            ),
+            gcs_object_prefix=os.getenv("GCS_OBJECT_PREFIX", "jobs"),
+        )
+
+
+# Clients initialized in lifespan startup
+settings = UploadServiceSettings.from_env()
+r = redis.from_url(settings.redis_url, decode_responses=True)
+gcs_client = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize GCS client and Redis connection at startup."""
+    global gcs_client
+    gcs_client = storage.Client()
+    yield
+    # Cleanup handled by context manager; GCS client does not require explicit close
+
+
 app = FastAPI(
     title="PixelRouter — Upload Service",
     description="Handles image uploads and job creation",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -23,14 +67,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Config from environment
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
-LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://load-balancer:8001")
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pixelrouter-images")
-
-# Redis client
-r = redis.from_url(REDIS_URL, decode_responses=True)
 
 
 @app.get("/")
@@ -49,10 +85,14 @@ async def health():
         redis_status = "connected"
     except Exception:
         redis_status = "disconnected"
+    
+    gcs_status = "initialized" if gcs_client is not None else "not_initialized"
+    
     return {
         "status": "ok",
         "service": "upload-service",
-        "redis": redis_status
+        "redis": redis_status,
+        "gcs": gcs_status
     }
 
 
