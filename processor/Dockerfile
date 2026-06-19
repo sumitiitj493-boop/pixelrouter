@@ -3,13 +3,17 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# 1. Install CPU-only PyTorch (Small ~150MB, much faster/stable)
+RUN pip install --no-cache-dir --default-timeout=1000 \
+    torch==2.3.0 torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Install the rest of requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-# Pre-download rembg's U2Net model (~170MB) at build time.
-# Without this the first request would hang 30-60s while downloading.
-# A 1x1 dummy image is enough to trigger the download and cache it.
-# Placed before COPY . . so Docker layer caching works — code changes
-# don't re-trigger the model download.
+RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
+
+# 3. Pre-download rembg model
 RUN python -c "\
 import rembg; \
 from PIL import Image; \
@@ -19,6 +23,7 @@ buf = io.BytesIO(); \
 img.save(buf, format='PNG'); \
 rembg.remove(buf.getvalue()); \
 print('rembg model pre-downloaded successfully')"
+
 COPY . .
 EXPOSE 8002
 # No --reload — this is a production image, files don't change at runtime.
