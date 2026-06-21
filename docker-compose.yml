@@ -12,6 +12,8 @@ services:
       - LOAD_BALANCER_URL=http://load-balancer:8001
       - GCS_BUCKET_NAME=pixelrouter-images
       - GCS_OBJECT_PREFIX=jobs
+      - GCS_URL_STRATEGY=${GCS_URL_STRATEGY:-gcs_uri}
+      - GCS_SIGNED_URL_TTL_SECONDS=${GCS_SIGNED_URL_TTL_SECONDS:-3600}
     depends_on:
       redis:
         condition: service_healthy
