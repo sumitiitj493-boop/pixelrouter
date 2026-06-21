@@ -72,20 +72,27 @@ async def upload_image(file: UploadFile = File(...)):
     # Generate unique job ID
     job_id = f"job_{uuid.uuid4().hex[:8]}"
 
+    # Call load balancer to get the assigned processor
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{LOAD_BALANCER_URL}/route")
+        response.raise_for_status()
+        route_decision = response.json()
+    processor_id = route_decision["processor_id"]
+
     # Create job record in Redis
     r.hset(f"job:{job_id}", mapping={
         "status": "pending",
         "filename": file.filename,
         "created_at": str(int(time.time())),
-        "processor": "",
+        "processor_id": processor_id,
         "result_url": ""
     })
 
     # Set TTL — auto-delete after 24 hours
     r.expire(f"job:{job_id}", 86400)
 
-    # Push to processing queue
-    r.lpush("image_queue", job_id)
+    # Push to processing queue for the SPECIFIC processor
+    r.lpush(f"queue:{processor_id}", job_id)
 
     return {
         "job_id": job_id,
