@@ -56,6 +56,10 @@ def _get_file_extension(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower()
 
 
+def _queue_key(processor_id: str) -> str:
+    return f"queue:{processor_id}"
+
+
 async def _upload_to_gcs(
     file_bytes: bytes,
     job_id: str,
@@ -249,9 +253,11 @@ async def upload_image(file: UploadFile = File(...)):
     # Set TTL — auto-delete after 24 hours
     r.expire(f"job:{job_id}", 86400)
 
-    # Push to processing queue
-    r.lpush("image_queue", job_id)
-    logger.info(f"[{job_id}] Queued for processing")
+    queue_key = _queue_key(route_decision["processor_id"])
+
+    # Push to the selected processor queue
+    r.lpush(queue_key, job_id)
+    logger.info(f"[{job_id}] Queued for processing on {queue_key}")
 
     return {
         "job_id": job_id,
@@ -261,6 +267,7 @@ async def upload_image(file: UploadFile = File(...)):
         "processor_url": route_decision["processor_url"],
         "tier": route_decision["tier"],
         "fallback_used": route_decision["fallback_used"],
+        "queue_key": queue_key,
         "message": "Job created and queued for processing"
     }
 
@@ -279,7 +286,13 @@ async def get_job_status(job_id: str):
 @app.get("/queue/length")
 async def queue_length():
     """
-    How many jobs are waiting to be processed.
+    How many jobs are waiting across all processor queues.
     """
-    length = r.llen("image_queue")
-    return {"queue_length": length}
+    queue_lengths = {
+        key: r.llen(key)
+        for key in r.scan_iter(match="queue:*")
+    }
+    return {
+        "queue_length": sum(queue_lengths.values()),
+        "queue_lengths": queue_lengths,
+    }
