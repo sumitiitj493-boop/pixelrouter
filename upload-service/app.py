@@ -129,6 +129,31 @@ def _queue_key(processor_id: str) -> str:
     return f"queue:{processor_id}"
 
 
+def _delete_gcs_object(object_name: str, job_id: str, reason: str) -> None:
+    """Best-effort cleanup for uploads that never become durable jobs."""
+    if gcs_client is None:
+        logger.warning(f"[{job_id}] Skipped GCS cleanup; client not initialized")
+        return
+
+    try:
+        bucket = gcs_client.bucket(settings.gcs_bucket_name)
+        bucket.blob(object_name).delete()
+        logger.info(f"[{job_id}] Removed GCS object after {reason}: {object_name}")
+    except Exception:
+        logger.exception(f"[{job_id}] Failed to clean up GCS object: {object_name}")
+
+
+def _rollback_job_record(job_key: str, queue_key: str, job_id: str) -> None:
+    """Best-effort Redis cleanup for failed job publication."""
+    try:
+        cleanup = r.pipeline(transaction=True)
+        cleanup.delete(job_key)
+        cleanup.lrem(queue_key, 0, job_id)
+        cleanup.execute()
+    except Exception:
+        logger.exception(f"[{job_id}] Failed to roll back Redis job state")
+
+
 async def _upload_to_gcs(
     file_bytes: bytes,
     job_id: str,
@@ -310,11 +335,21 @@ async def upload_image(file: UploadFile = File(...)):
         file.content_type
     )
 
-    route_decision = await _get_route_decision(job_id)
+    try:
+        route_decision = await _get_route_decision(job_id)
+    except HTTPException:
+        _delete_gcs_object(
+            gcs_metadata["object_name"],
+            job_id,
+            "routing failure"
+        )
+        raise
 
-    r.hset(f"job:{job_id}", mapping={
+    job_key = f"job:{job_id}"
+    queue_key = _queue_key(route_decision["processor_id"])
+    job_record = {
         "status": "pending",
-        "filename": file.filename,
+        "filename": file.filename or "",
         "created_at": str(int(time.time())),
         "gcs_bucket": gcs_metadata["bucket_name"],
         "gcs_object": gcs_metadata["object_name"],
@@ -332,15 +367,28 @@ async def upload_image(file: UploadFile = File(...)):
         "scaling_action": route_decision["scaling_action"],
         "route_reason": route_decision["reason"],
         "result_url": ""
-    })
+    }
 
-    # Job metadata is transient; source objects follow the bucket lifecycle.
-    r.expire(f"job:{job_id}", 86400)
+    try:
+        # Job metadata and queue publication must commit together.
+        publish = r.pipeline(transaction=True)
+        publish.hset(job_key, mapping=job_record)
+        publish.expire(job_key, 86400)
+        publish.lpush(queue_key, job_id)
+        publish.execute()
+    except Exception as exc:
+        _rollback_job_record(job_key, queue_key, job_id)
+        _delete_gcs_object(
+            gcs_metadata["object_name"],
+            job_id,
+            "Redis publication failure"
+        )
+        logger.error(f"[{job_id}] Redis job publication failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to publish job"
+        ) from exc
 
-    queue_key = _queue_key(route_decision["processor_id"])
-
-    # Queue publication happens only after storage and routing succeed.
-    r.lpush(queue_key, job_id)
     logger.info(f"[{job_id}] Queued for processing on {queue_key}")
 
     return {
