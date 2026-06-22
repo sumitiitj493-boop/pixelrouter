@@ -24,9 +24,10 @@ r.hset(f"job:{job_id}", mapping={
 })
 
 # 2. Push to queue — processor's worker_loop is BRPOP-ing this
-r.lpush("image_queue", job_id)
+TARGET_PROCESSOR = "processor-1"  # must match PROCESSOR_ID env var of the running container
+r.lpush(f"queue:{TARGET_PROCESSOR}", job_id)
 
-print(f"Pushed job: {job_id}")
+print(f"Pushed job: {job_id} to queue:{TARGET_PROCESSOR}")
 print(f"Watch processor logs — should see 'Picked up job: {job_id}'")
 print(f"Poll result with: redis-cli HGETALL job:{job_id}")
 
