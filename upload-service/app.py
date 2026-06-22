@@ -3,18 +3,270 @@
 #                 ask load balancer which processor to use,
 #                 track job state in Redis
 
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from google.cloud import storage
 import httpx
 import redis
 import os
 import uuid
 import time
+import logging
+
+
+logger = logging.getLogger("upload-service")
+
+CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": {"jpg", "jpeg"},
+    "image/png": {"png"},
+    "image/webp": {"webp"},
+}
+CANONICAL_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+GCS_URL_STRATEGIES = {"gcs_uri", "signed", "public"}
+
+
+@dataclass(frozen=True)
+class UploadServiceSettings:
+    """Configuration loaded once at startup from environment."""
+    redis_url: str
+    load_balancer_url: str
+    gcs_bucket_name: str
+    gcs_object_prefix: str
+    gcs_url_strategy: str
+    gcs_signed_url_ttl_seconds: int
+
+    @staticmethod
+    def from_env() -> "UploadServiceSettings":
+        url_strategy = os.getenv("GCS_URL_STRATEGY", "gcs_uri").lower()
+        if url_strategy not in GCS_URL_STRATEGIES:
+            raise ValueError(
+                "GCS_URL_STRATEGY must be one of: gcs_uri, signed, public"
+            )
+        signed_url_ttl = int(os.getenv("GCS_SIGNED_URL_TTL_SECONDS", "3600"))
+        if signed_url_ttl <= 0:
+            raise ValueError("GCS_SIGNED_URL_TTL_SECONDS must be positive")
+
+        return UploadServiceSettings(
+            redis_url=os.getenv("REDIS_URL", "redis://redis:6379"),
+            load_balancer_url=os.getenv(
+                "LOAD_BALANCER_URL",
+                "http://load-balancer:8001"
+            ),
+            gcs_bucket_name=os.getenv(
+                "GCS_BUCKET_NAME",
+                "pixelrouter-images"
+            ),
+            gcs_object_prefix=os.getenv("GCS_OBJECT_PREFIX", "jobs"),
+            gcs_url_strategy=url_strategy,
+            gcs_signed_url_ttl_seconds=signed_url_ttl,
+        )
+
+
+# Process-wide clients; lifespan owns GCS initialization.
+settings = UploadServiceSettings.from_env()
+r = redis.from_url(settings.redis_url, decode_responses=True)
+gcs_client = None
+
+
+def _get_file_extension(filename: str, content_type: str) -> str:
+    """Return a safe extension consistent with the validated media type."""
+    extension = ""
+    if filename and "." in filename:
+        extension = filename.rsplit(".", 1)[-1].lower()
+
+    if extension in CONTENT_TYPE_EXTENSIONS[content_type]:
+        return extension
+    return CANONICAL_EXTENSIONS[content_type]
+
+
+def _build_object_name(job_id: str, filename: str, content_type: str) -> str:
+    prefix = settings.gcs_object_prefix.strip("/")
+    extension = _get_file_extension(filename, content_type)
+    object_name = f"{job_id}.{extension}"
+    return f"{prefix}/{object_name}" if prefix else object_name
+
+
+def _build_access_metadata(blob, gcs_uri: str) -> dict:
+    strategy = settings.gcs_url_strategy
+
+    if strategy == "signed":
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=settings.gcs_signed_url_ttl_seconds
+        )
+        access_url = blob.generate_signed_url(
+            version="v4",
+            expiration=expires_at,
+            method="GET",
+        )
+        return {
+            "access_url": access_url,
+            "url_strategy": strategy,
+            "url_expires_at": expires_at.isoformat(),
+        }
+
+    if strategy == "public":
+        return {
+            "access_url": blob.public_url,
+            "url_strategy": strategy,
+            "url_expires_at": "",
+        }
+
+    return {
+        "access_url": gcs_uri,
+        "url_strategy": strategy,
+        "url_expires_at": "",
+    }
+
+
+def _queue_key(processor_id: str) -> str:
+    return f"queue:{processor_id}"
+
+
+def _delete_gcs_object(object_name: str, job_id: str, reason: str) -> None:
+    """Best-effort cleanup for uploads that never become durable jobs."""
+    if gcs_client is None:
+        logger.warning(f"[{job_id}] Skipped GCS cleanup; client not initialized")
+        return
+
+    try:
+        bucket = gcs_client.bucket(settings.gcs_bucket_name)
+        bucket.blob(object_name).delete()
+        logger.info(f"[{job_id}] Removed GCS object after {reason}: {object_name}")
+    except Exception:
+        logger.exception(f"[{job_id}] Failed to clean up GCS object: {object_name}")
+
+
+def _rollback_job_record(job_key: str, queue_key: str, job_id: str) -> None:
+    """Best-effort Redis cleanup for failed job publication."""
+    try:
+        cleanup = r.pipeline(transaction=True)
+        cleanup.delete(job_key)
+        cleanup.lrem(queue_key, 0, job_id)
+        cleanup.execute()
+    except Exception:
+        logger.exception(f"[{job_id}] Failed to roll back Redis job state")
+
+
+async def _upload_to_gcs(
+    file_bytes: bytes,
+    job_id: str,
+    filename: str,
+    content_type: str
+) -> dict:
+    """
+    Upload validated image bytes and return the storage access contract.
+    """
+    if gcs_client is None:
+        raise RuntimeError("GCS client not initialized")
+    
+    object_name = _build_object_name(job_id, filename, content_type)
+    
+    bucket = gcs_client.bucket(settings.gcs_bucket_name)
+    blob = bucket.blob(object_name)
+    uploaded = False
+    
+    try:
+        blob.upload_from_string(
+            file_bytes,
+            content_type=content_type
+        )
+        uploaded = True
+        gcs_uri = f"gs://{settings.gcs_bucket_name}/{object_name}"
+        access_metadata = _build_access_metadata(blob, gcs_uri)
+        logger.info(
+            f"[{job_id}] Uploaded to GCS: {object_name} ({len(file_bytes)} bytes)"
+        )
+    except Exception as exc:
+        if uploaded:
+            try:
+                blob.delete()
+            except Exception:
+                logger.exception(f"[{job_id}] Failed to roll back GCS object")
+        logger.error(f"[{job_id}] GCS upload failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="GCS upload failed"
+        ) from exc
+    
+    return {
+        "object_name": object_name,
+        "bucket_name": settings.gcs_bucket_name,
+        "gcs_path": gcs_uri,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        **access_metadata,
+    }
+
+
+async def _get_route_decision(job_id: str) -> dict:
+    """Fetch the current routing decision from the load balancer."""
+    route_url = f"{settings.load_balancer_url.rstrip('/')}/route"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            response = await client.get(route_url)
+            response.raise_for_status()
+            route_data = response.json()
+    except httpx.HTTPStatusError as exc:
+        logger.error(f"[{job_id}] Load balancer returned {exc.response.status_code}")
+        raise HTTPException(
+            status_code=502,
+            detail="Load balancer route request failed"
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.error(f"[{job_id}] Load balancer request failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Load balancer is unavailable"
+        ) from exc
+    except ValueError as exc:
+        logger.error(f"[{job_id}] Invalid route response: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid load balancer response"
+        ) from exc
+
+    processor_url = route_data.get("processor_url")
+    processor_id = route_data.get("processor_id")
+    tier = route_data.get("tier")
+
+    if not processor_url or not processor_id or not tier:
+        raise HTTPException(
+            status_code=502,
+            detail="Incomplete routing metadata from load balancer"
+        )
+
+    return {
+        "processor_url": processor_url,
+        "processor_id": processor_id,
+        "tier": tier,
+        "fallback_used": bool(route_data.get("fallback_used", False)),
+        "scaled": bool(route_data.get("scaled", False)),
+        "scaling_action": route_data.get("scaling_action", ""),
+        "reason": route_data.get("reason", ""),
+    }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize GCS client and Redis connection at startup."""
+    global gcs_client
+    gcs_client = storage.Client()
+    yield
+
 
 app = FastAPI(
     title="PixelRouter — Upload Service",
     description="Handles image uploads and job creation",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -23,14 +275,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Config from environment
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
-LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://load-balancer:8001")
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pixelrouter-images")
-
-# Redis client
-r = redis.from_url(REDIS_URL, decode_responses=True)
 
 
 @app.get("/")
@@ -49,55 +293,116 @@ async def health():
         redis_status = "connected"
     except Exception:
         redis_status = "disconnected"
+    
+    gcs_status = "initialized" if gcs_client is not None else "not_initialized"
+    
     return {
         "status": "ok",
         "service": "upload-service",
-        "redis": redis_status
+        "redis": redis_status,
+        "gcs": gcs_status
     }
 
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     """
-    Accept an image upload and create a job.
+    Accept an image upload, store in GCS, create a job, and enqueue.
     Returns job_id for tracking.
-    TODO: Store image in GCS
-    TODO: Ask load balancer which processor to route to
-    TODO: Push job_id to Redis queue
     """
-    # Validate file type
     if file.content_type not in ["image/jpeg", "image/png", "image/webp"]:
         raise HTTPException(status_code=400, detail="Only JPEG, PNG, WebP allowed")
 
-    # Generate unique job ID
     job_id = f"job_{uuid.uuid4().hex[:8]}"
+    
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"[{job_id}] File read failed: {exc}")
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to read file"
+        ) from exc
 
-    # Call load balancer to get the assigned processor
-    async with httpx.AsyncClient() as client:
-        response = await client.get(f"{LOAD_BALANCER_URL}/route")
-        response.raise_for_status()
-        route_decision = response.json()
-    processor_id = route_decision["processor_id"]
+    gcs_metadata = await _upload_to_gcs(
+        file_bytes,
+        job_id,
+        file.filename or "upload.jpg",
+        file.content_type
+    )
 
-    # Create job record in Redis
-    r.hset(f"job:{job_id}", mapping={
+    try:
+        route_decision = await _get_route_decision(job_id)
+    except HTTPException:
+        _delete_gcs_object(
+            gcs_metadata["object_name"],
+            job_id,
+            "routing failure"
+        )
+        raise
+
+    job_key = f"job:{job_id}"
+    queue_key = _queue_key(route_decision["processor_id"])
+    job_record = {
         "status": "pending",
-        "filename": file.filename,
+        "filename": file.filename or "",
         "created_at": str(int(time.time())),
-        "processor_id": processor_id,
+        "gcs_bucket": gcs_metadata["bucket_name"],
+        "gcs_object": gcs_metadata["object_name"],
+        "gcs_path": gcs_metadata["gcs_path"],
+        "gcs_access_url": gcs_metadata["access_url"],
+        "gcs_url_strategy": gcs_metadata["url_strategy"],
+        "gcs_url_expires_at": gcs_metadata["url_expires_at"],
+        "gcs_content_type": gcs_metadata["content_type"],
+        "gcs_size_bytes": str(gcs_metadata["size_bytes"]),
+        "processor_id": route_decision["processor_id"],
+        "processor_url": route_decision["processor_url"],
+        "processor_tier": route_decision["tier"],
+        "fallback_used": str(route_decision["fallback_used"]).lower(),
+        "scaled": str(route_decision["scaled"]).lower(),
+        "scaling_action": route_decision["scaling_action"],
+        "route_reason": route_decision["reason"],
         "result_url": ""
-    })
+    }
 
-    # Set TTL — auto-delete after 24 hours
-    r.expire(f"job:{job_id}", 86400)
+    try:
+        # Job metadata and queue publication must commit together.
+        publish = r.pipeline(transaction=True)
+        publish.hset(job_key, mapping=job_record)
+        publish.expire(job_key, 86400)
+        publish.lpush(queue_key, job_id)
+        publish.execute()
+    except Exception as exc:
+        _rollback_job_record(job_key, queue_key, job_id)
+        _delete_gcs_object(
+            gcs_metadata["object_name"],
+            job_id,
+            "Redis publication failure"
+        )
+        logger.error(f"[{job_id}] Redis job publication failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to publish job"
+        ) from exc
 
-    # Push to processing queue for the SPECIFIC processor
-    r.lpush(f"queue:{processor_id}", job_id)
+    logger.info(f"[{job_id}] Queued for processing on {queue_key}")
 
     return {
         "job_id": job_id,
         "status": "pending",
-        "message": "Job created successfully"
+        "gcs_path": gcs_metadata["gcs_path"],
+        "gcs_access_url": gcs_metadata["access_url"],
+        "gcs_url_strategy": gcs_metadata["url_strategy"],
+        "processor_id": route_decision["processor_id"],
+        "processor_url": route_decision["processor_url"],
+        "tier": route_decision["tier"],
+        "fallback_used": route_decision["fallback_used"],
+        "queue_key": queue_key,
+        "message": "Job created and queued for processing"
     }
 
 
@@ -115,7 +420,13 @@ async def get_job_status(job_id: str):
 @app.get("/queue/length")
 async def queue_length():
     """
-    How many jobs are waiting to be processed.
+    How many jobs are waiting across all processor queues.
     """
-    length = r.llen("image_queue")
-    return {"queue_length": length}
+    queue_lengths = {
+        key: r.llen(key)
+        for key in r.scan_iter(match="queue:*")
+    }
+    return {
+        "queue_length": sum(queue_lengths.values()),
+        "queue_lengths": queue_lengths,
+    }

@@ -79,6 +79,16 @@ Then open `http://localhost:8501`.
 | `GET /processors/status` | Lists registered local/cloud processors with status, CPU, pending jobs, and timestamps |
 | `GET /scaling/status` | Shows local count, max processor limit, overload state, and cloud fallback configuration |
 
+## Upload Storage Contract
+
+- Uploaded images use deterministic keys in the form
+  `<GCS_OBJECT_PREFIX>/<job_id>.<validated-extension>`.
+- Every job stores bucket, object name, private GCS URI, content type, byte size,
+  access URL strategy, and access URL expiry metadata.
+- `GCS_URL_STRATEGY` supports `gcs_uri` for credentialed services, `signed` for
+  temporary external access, and `public` for buckets with public-read IAM.
+- Signed URL lifetime is controlled by `GCS_SIGNED_URL_TTL_SECONDS`.
+
 ## Load Balancer Config
 
 | Variable | Default | Purpose |
