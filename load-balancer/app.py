@@ -295,7 +295,7 @@ async def get_best_processor():
     processor_urls = get_processor_urls(
         r,
         processor_type="local",
-        statuses={"active", "stale"},
+        statuses={"active", "stale", "unhealthy"},
     )
     await refresh_processor_metrics(processor_urls)
     processor_urls = get_processor_urls(
