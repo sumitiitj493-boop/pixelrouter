@@ -52,6 +52,7 @@ class LoadBalancerSettings:
     metrics_refresh_timeout_seconds: float
     local_autoscale_enabled: bool
     max_processors: int
+    max_failed_polls: int
     processor_base_port: int
     processor_image: str
     processor_network: str
@@ -78,6 +79,7 @@ def get_settings() -> LoadBalancerSettings:
         ),
         local_autoscale_enabled=_get_bool("LOCAL_AUTOSCALE_ENABLED", True),
         max_processors=_get_int("MAX_PROCESSORS", 5),
+        max_failed_polls=_get_int("MAX_FAILED_POLLS", 3),
         processor_base_port=_get_int("PROCESSOR_BASE_PORT", 8002),
         # Future Docker SDK autoscaling uses these values to launch processors
         # that match the compose-managed local processor contract.
