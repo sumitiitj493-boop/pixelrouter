@@ -2,150 +2,65 @@
 
 > Scalable Hybrid Cloud Image Processing Platform
 
-PixelRouter is an early-stage distributed image processing platform. It is being
-designed to accept image uploads, route work across local processors and future
-cloud processors, run AI image tasks such as background removal and captioning,
-and expose system health through a Streamlit dashboard.
+PixelRouter is a distributed image processing platform designed for high availability and elastic scaling. It accepts image uploads, routes workloads across a fleet of local and cloud processors, and executes AI-driven image tasks (background removal, captioning).
 
 ## Architecture
 
-| Service | Port | Tech |
-|---------|------|------|
+| Service | Port | Tech Stack |
+|---------|------|------------|
 | Upload Service | 8000 | FastAPI, Redis, GCS |
 | Load Balancer | 8001 | FastAPI, Redis, httpx, Docker SDK |
-| Processor (x2 local) | 8002, 8003 | FastAPI, rembg, BLIP, psutil |
-| Processor (GCP) | Cloud Run | Same image, cloud deployment planned |
+| Processor (Local) | 8002+ | FastAPI, rembg, BLIP, psutil |
+| Processor (Cloud) | Cloud Run | GCP Cloud Run |
 | Dashboard | 8501 | Streamlit, Plotly |
-| Redis | 6379 | Job state, queue, metrics |
+| Redis | 6379 | State Management, Queueing, Metrics |
 
 ## Quick Start
 
 ```bash
-cp .env.example .env          # fill in your GCP credentials if needed
-make build                    # build all images
-make up                       # start all services
-make logs                     # follow logs
+cp .env.example .env          # Configure GCP credentials & environment
+make build                    # Build Docker images
+make up                       # Start local environment
 ```
-
-To view only the current dashboard scaffold:
-
-```bash
-docker compose up dashboard redis
-```
-
-Then open `http://localhost:8501`.
-
-## Current Load Balancer Behavior
-
-- Reads live processor metrics from Redis keys like `metrics:processor-1:cpu`
-  and `metrics:processor-1:pending`.
-- Maintains a Redis processor registry with processor ID, URL, type, status,
-  creation time, and last metrics timestamp.
-- Bootstraps the registry from `PROCESSOR_URLS` and optional
-  `CLOUD_RUN_PROCESSOR_URL`, so future autoscaled processors can join the same
-  routing path.
-- Refreshes registered local processors before routing and marks failed metric
-  polls as `stale`.
-- Excludes Cloud Run from normal metric refresh until cloud fallback is used.
-- Ignores processors that do not have live CPU metrics.
-- Detects overload only across live local processors. If at least one live local
-  processor is below `MAX_CPU_THRESHOLD`, routing stays local and no scaling is
-  requested.
-- Selects the processor with the lowest pending job count; CPU percentage is the
-  tiebreaker.
-- Does not increment `pending_jobs` when `/route` is called. Pending count should
-  increase only after a processor actually accepts or claims the job.
-- Uses a thread-safe `update_pending_count()` helper with Redis `INCRBY`, clamps
-  negative counts to `0`, and refreshes the metrics TTL.
-- If all live local processors exceed `MAX_CPU_THRESHOLD`, the Docker
-  autoscaler attempts to spawn one additional local processor.
-- Local autoscaling registers each new processor in Redis and stops at
-  `MAX_PROCESSORS`.
-- If local capacity is still overloaded at `MAX_PROCESSORS`, `/route` falls
-  back to the configured Cloud Run processor and returns
-  `reason=cloud_fallback_max_local_capacity`.
-- `/route` returns routing metadata including `processor_url`, `processor_id`,
-  `tier`, `scaled`, `fallback_used`, `scaling_action`, and `reason`.
-- Unit tests mock the Docker SDK and Redis so routing and autoscaling logic can
-  be exercised without the full container stack.
-- A separate Docker Compose smoke test path is reserved for validating real
-  processor registration and routing against running containers.
-
-## Load Balancer API
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /route` | Refreshes local metrics, selects a local processor, scales locally, or returns Cloud Run fallback |
-| `GET /processors/status` | Lists registered local/cloud processors with status, CPU, pending jobs, and timestamps |
-| `GET /scaling/status` | Shows local count, max processor limit, overload state, and cloud fallback configuration |
-
-## Upload Storage Contract
-
-- Uploaded images use deterministic keys in the form
-  `<GCS_OBJECT_PREFIX>/<job_id>.<validated-extension>`.
-- Every job stores bucket, object name, private GCS URI, content type, byte size,
-  access URL strategy, and access URL expiry metadata.
-- `GCS_URL_STRATEGY` supports `gcs_uri` for credentialed services, `signed` for
-  temporary external access, and `public` for buckets with public-read IAM.
-- Signed URL lifetime is controlled by `GCS_SIGNED_URL_TTL_SECONDS`.
-
-## Load Balancer Config
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `REDIS_URL` | `redis://redis:6379` | Redis connection used for metrics and routing state |
-| `PROCESSOR_URLS` | `http://processor-1:8002,http://processor-2:8003` | Initial local processor pool |
-| `MAX_CPU_THRESHOLD` | `80` | CPU percentage where a live processor is considered overloaded |
-| `METRICS_REFRESH_TIMEOUT_SECONDS` | `2` | Timeout for polling each processor's `/metrics` endpoint |
-| `LOCAL_AUTOSCALE_ENABLED` | `true` | Feature flag for future Docker SDK local autoscaling |
-| `MAX_PROCESSORS` | `5` | Maximum local processor containers allowed |
-| `PROCESSOR_BASE_PORT` | `8002` | First local processor port for dynamic processor naming/ports |
-| `PROCESSOR_IMAGE` | `pixelrouter-processor:latest` | Docker image future autoscaling should launch |
-| `PROCESSOR_NETWORK` | `pixelrouter_pixelrouter-network` | Docker network future autoscaled processors should join |
-| `CLOUD_RUN_PROCESSOR_URL` | empty | Cloud Run processor fallback endpoint |
+Access the dashboard at `http://localhost:8501`.
 
 ## Key Features
 
-- CPU-aware load balancer routing based on live processor utilization
-- Redis-backed job state, queue, and processor metrics
-- Local Docker Compose processor pool
-- Planned hybrid cloud support with GCP Cloud Run
-- Planned image processing pipeline using rembg and BLIP
-- Streamlit dashboard scaffold for future real-time monitoring
+- **CPU-Aware Routing:** Distributes jobs dynamically based on live processor utilization (lowest pending jobs, then lowest CPU usage) to prevent bottlenecks.
+- **Fault Tolerance & Auto-Recovery:** 
+  - Actively polls processor health via `/metrics`. 
+  - Marks processors as `unhealthy` after `MAX_FAILED_POLLS` consecutive failures.
+  - Automatically and asynchronously requeues orphaned jobs from dead processors to healthy ones without blocking incoming traffic.
+  - Processors automatically recover to `active` status once they become responsive again.
+- **Hybrid Autoscaling:** Seamlessly scales up local Docker processors under heavy load, and falls back to GCP Cloud Run when local capacity reaches `MAX_PROCESSORS`.
+- **Robust Storage:** Securely uploads assets to Google Cloud Storage (GCS) using deterministic keys and short-lived signed URLs.
+- **Redis-Backed State:** Utilizes Redis for a centralized processor registry, atomic counter updates (`INCRBY`), job state management, and real-time metrics.
 
-## Tech Stack
+## Configuration Highlights (Load Balancer)
 
-Python - FastAPI - Docker - Docker Compose - Redis - GCP Cloud Run -
-Google Cloud Storage - rembg - BLIP - Streamlit - Plotly - psutil
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MAX_CPU_THRESHOLD` | `80` | CPU utilization threshold triggering overload protocols |
+| `MAX_PROCESSORS` | `5` | Maximum allowed local processor containers |
+| `MAX_FAILED_POLLS` | `3` | Consecutive failed health checks before a processor is marked unhealthy |
+| `CLOUD_RUN_PROCESSOR_URL` | empty | GCP Cloud Run endpoint for cloud fallback |
 
-## Status
+## Project Status
 
 Under active development.
 
-- [x] Project scaffolded
-- [x] Load balancer CPU-aware router selection
-- [x] Redis-backed processor registry
-- [x] Thread-safe pending count helper
-- [x] Docker SDK local autoscaling manager
-- [x] MAX_PROCESSORS local scale limit
-- [ ] Processor job claim flow increments/decrements pending counts
-- [ ] Upload service file handling and GCS storage
-- [ ] Processor rembg + BLIP pipeline
+- [x] Load balancer CPU-aware routing & Redis registry
+- [x] Docker SDK local autoscaling & Cloud fallback
+- [x] Upload service GCS integration & signed URLs
+- [x] Processor fault tolerance & asynchronous orphan requeuing
+- [ ] Processor image pipeline (rembg + BLIP)
 - [ ] Dashboard real-time monitoring
-- [ ] GCP Cloud Run deployment
 
-## Tests
+## Testing
 
+Unit tests extensively mock the Docker SDK and Redis to validate routing, autoscaling, and requeue logic without requiring a container stack.
 ```bash
 pip install -r requirements-dev.txt
 make test
+make smoke-test # Validates real processor registration against running containers
 ```
-
-For a real-container smoke pass after `docker compose up -d --build`, run:
-
-```bash
-make smoke-test
-```
-
-Runtime dependencies are kept inside each service folder. The root
-`requirements-dev.txt` is only for local development and test tooling.
