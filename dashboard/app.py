@@ -10,8 +10,11 @@
 # TODO: Implement job queue visualization
 # TODO: Implement manual routing override
 
+import os
+import httpx
+import redis
 import streamlit as st
-
+from streamlit_autorefresh import st_autorefresh
 st.set_page_config(
     page_title="PixelRouter Dashboard",
     layout="wide"
@@ -19,6 +22,49 @@ st.set_page_config(
 
 st.title(" PixelRouter — Admin Dashboard")
 st.caption("Real-time monitoring for hybrid cloud image processing")
+
+# Configure page auto-refresh (2000ms interval) for live updates.
+st_autorefresh(interval=2000, limit=None, key="dashboard_autorefresh")
+
+LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://load-balancer:8001")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+
+@st.cache_resource
+def get_redis_client() -> redis.Redis:
+    return redis.from_url(REDIS_URL, decode_responses=True)
+
+redis_client = get_redis_client()
+
+
+def fetch_processor_status() -> dict:
+    try:
+        response = httpx.get(f"{LOAD_BALANCER_URL}/processors/status", timeout=2.0)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPError as exc:
+        st.error(f"Failed to fetch processor status: {exc}")
+        return {"processors": []}
+
+
+def fetch_scaling_status() -> dict:
+    try:
+        response = httpx.get(f"{LOAD_BALANCER_URL}/scaling/status", timeout=2.0)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPError as exc:
+        st.error(f"Failed to fetch scaling status: {exc}")
+        return {}
+
+
+def fetch_jobs(r: redis.Redis) -> list[dict]:
+    jobs = []
+    # Safely iterate over keys without blocking the Redis event loop
+    for key in r.scan_iter(match="job:*"):
+        job_data = r.hgetall(key)
+        if job_data:
+            job_data["job_id"] = key.split(":", 1)[1]
+            jobs.append(job_data)
+    return jobs
 
 col1, col2, col3 = st.columns(3)
 with col1:
