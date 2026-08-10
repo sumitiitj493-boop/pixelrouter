@@ -13,6 +13,8 @@
 import asyncio
 import logging
 import os
+import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Dict
@@ -75,6 +77,66 @@ async def download_image(gcs_path: str) -> bytes:
     """Async wrapper — same run_in_executor pattern as pipeline.py (A1)."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(io_executor, _download_blob_sync, gcs_path)
+
+
+
+def _upload_blob_sync(bucket_name: str, blob_path: str, data: bytes, content_type: str) -> str:
+    """
+    Uploads raw bytes to a GCS path. Synchronous — call via run_in_executor.
+    Mirrors _download_blob_sync from A3, same client, opposite direction.
+
+    Returns the gs:// URL of the uploaded object — this is what gets
+    written into the job hash as result_url.
+    """
+    client = _get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(data, content_type=content_type)
+    return f"gs://{bucket_name}/{blob_path}"
+
+
+async def upload_bytes(blob_path: str, data: bytes, content_type: str) -> str:
+    """
+    Async wrapper — same run_in_executor pattern as download_image().
+    Uses GCS_BUCKET_NAME (already defined as a module-level constant
+    in A3's config section) so callers only pass the path within the bucket.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        io_executor, _upload_blob_sync, GCS_BUCKET_NAME, blob_path, data, content_type
+    )
+
+
+async def save_result(job_id: str, result_bytes: bytes, caption: str) -> str:
+    """
+    Uploads BOTH result objects for a finished job:
+      1. The processed PNG  → results/{job_id}.png
+      2. A small JSON sidecar with metadata → results/{job_id}.json
+
+    Returns the result_url (gs:// path to the PNG) — the single field
+    process_job() needs to write into the job hash.
+    """
+    png_path = f"results/{job_id}.png"
+    json_path = f"results/{job_id}.json"
+
+    # Upload the image first — if this fails, we don't want a metadata
+    # file pointing at an image that was never written.
+    result_url = await upload_bytes(png_path, result_bytes, "image/png")
+
+    metadata = {
+        "job_id": job_id,
+        "caption": caption,
+        "result_url": result_url,
+        "completed_at": int(time.time()),
+    }
+    await upload_bytes(
+        json_path,
+        json.dumps(metadata).encode("utf-8"),
+        "application/json",
+    )
+
+    return result_url
+
 
 
 # ── Connection Manager ───────────────────────────────────────────────────────
@@ -204,19 +266,32 @@ async def process_job(job_id: str):
             progress_callback=on_progress,
         )
 
-        # Step 4 — done (GCS upload of result_bytes is A4's job)
-        # For now: record caption + status so the rest of the system
-        # (dashboard, /job/{id}) already has something meaningful to show.
+        # Step 4 — done. A4: actually persist result_bytes instead of
+        # discarding it. emit one more progress stage so the WebSocket
+        # / dashboard can show "uploading result" before the final event.
+        await on_progress("uploading_result", 97)
+
+        result_url = await save_result(
+            job_id=job_id,
+            result_bytes=result["result_bytes"],
+            caption=result["caption"],
+        )
+
         r.hset(f"job:{job_id}", mapping={
             "status": "done",
             "caption": result["caption"],
+            "result_url": result_url,
         })
         await manager.send(job_id, {
             "type": "complete",
             "job_id": job_id,
             "caption": result["caption"],
+            "result_url": result_url,
         })
-        logger.info(f"[{job_id}] Done. Caption: {result['caption']}")
+        logger.info(
+            f"[{job_id}] Done. Caption: {result['caption']} | "
+            f"Result: {result_url}"
+        )
 
     except Exception as e:
         # One bad job (corrupt image, missing GCS object, model error, etc.)
