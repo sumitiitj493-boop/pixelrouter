@@ -12,7 +12,7 @@ from google.cloud import storage
 
 r = redis.from_url("redis://localhost:6379", decode_responses=True)
 
-BUCKET = "pixelrouter-images-yourname"  # your actual bucket name
+BUCKET = "pixelrouter-images-sumit"  # your actual bucket name
 job_id = f"job_{uuid.uuid4().hex[:8]}"
 
 r.hset(f"job:{job_id}", mapping={
