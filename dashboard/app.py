@@ -13,6 +13,8 @@
 import os
 import httpx
 import redis
+import pandas as pd
+import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 st.set_page_config(
@@ -93,6 +95,35 @@ def get_status_emoji(status: str) -> str:
     elif status == "unhealthy":
         return "🔴 Unhealthy"
     return f"⚪ {status.capitalize()}"
+
+st.subheader("CPU Utilization")
+if processors:
+    # Enforce numeric types for Plotly to render the Y-axis correctly
+    df_processors = pd.DataFrame(processors)
+    df_processors["cpu_percent"] = pd.to_numeric(df_processors["cpu_percent"], errors="coerce").fillna(0)
+    
+    fig = px.bar(
+        df_processors,
+        x="processor_id",
+        y="cpu_percent",
+        color="status",
+        title="Live Processor CPU Load",
+        labels={"cpu_percent": "CPU Usage (%)", "processor_id": "Processor Node"},
+        range_y=[0, 100]
+    )
+    
+    # Overlay the load balancer scaling threshold for visual context
+    max_threshold = scaling_status_data.get("max_cpu_threshold", 80.0)
+    fig.add_hline(
+        y=max_threshold,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"Autoscale Threshold ({max_threshold}%)"
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("No CPU telemetry available.")
 
 st.subheader("Processor Status")
 if processors:
