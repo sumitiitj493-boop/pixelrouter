@@ -135,3 +135,41 @@ if processors:
     st.markdown(md_table)
 else:
     st.info("No processors registered yet.")
+
+st.subheader("Real-time Job Queue")
+jobs_data = fetch_jobs(redis_client)
+
+if jobs_data:
+    df_jobs = pd.DataFrame(jobs_data)
+    
+    # Ensure all required display columns exist to avoid KeyError if Redis hash is partial
+    for col in ["job_id", "status", "processor_id", "route_reason", "created_at"]:
+        if col not in df_jobs.columns:
+            df_jobs[col] = "—"
+            
+    # Surface actionable tasks by sorting pending/processing jobs to the top,
+    # followed by the most recently created jobs.
+    df_jobs["status_priority"] = df_jobs["status"].map({
+        "pending": 0,
+        "processing": 1,
+        "completed": 2,
+        "failed": 3
+    }).fillna(99)
+    
+    df_jobs["created_at_num"] = pd.to_numeric(df_jobs["created_at"], errors="coerce").fillna(0.0)
+    df_jobs = df_jobs.sort_values(
+        by=["status_priority", "created_at_num"], 
+        ascending=[True, False]
+    )
+    
+    # Format cleanly for the UI
+    display_df = df_jobs[["job_id", "status", "processor_id", "route_reason"]].rename(columns={
+        "job_id": "Job ID",
+        "status": "Status",
+        "processor_id": "Target Processor",
+        "route_reason": "Reason"
+    })
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+else:
+    st.info("No active or historical jobs found in the queue.")
