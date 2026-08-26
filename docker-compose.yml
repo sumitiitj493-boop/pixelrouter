@@ -43,6 +43,7 @@ services:
       - REDIS_URL=redis://redis:6379
       - PROCESSOR_URLS=http://processor-1:8002,http://processor-2:8003
       - MAX_CPU_THRESHOLD=80
+      - MAX_FAILED_POLLS=3
       - METRICS_REFRESH_TIMEOUT_SECONDS=2
       - LOCAL_AUTOSCALE_ENABLED=true
       - MAX_PROCESSORS=5

@@ -106,17 +106,24 @@ def get_processor_urls(
 
 
 def mark_processor_metrics_seen(redis_client, processor_id: str):
-    # Refresh the processor status whenever metrics arrive to keep the routing
-    # view aligned with live health signals.
     redis_client.hset(processor_key(processor_id), mapping={
         "status": "active",
         "last_metrics_at": str(int(time.time())),
+        "failed_polls": "0",
     })
 
 
 def mark_processor_stale(redis_client, processor_id: str):
-    # Stale processors stay registered but are excluded from the active pool
-    # until a later metrics refresh proves they are reachable again.
     redis_client.hset(processor_key(processor_id), mapping={
         "status": "stale",
+    })
+
+
+def increment_processor_failed_polls(redis_client, processor_id: str) -> int:
+    return redis_client.hincrby(processor_key(processor_id), "failed_polls", 1)
+
+
+def mark_processor_unhealthy(redis_client, processor_id: str):
+    redis_client.hset(processor_key(processor_id), mapping={
+        "status": "unhealthy",
     })

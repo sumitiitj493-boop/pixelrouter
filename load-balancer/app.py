@@ -3,6 +3,7 @@
 #                 Poll processor metrics before routing.
 #                 Request autoscaling when all processors are overloaded.
 
+import asyncio
 from fastapi import FastAPI, HTTPException
 import httpx
 import redis
@@ -15,7 +16,10 @@ from registry import (
     get_processors,
     mark_processor_metrics_seen,
     mark_processor_stale,
+    increment_processor_failed_polls,
+    mark_processor_unhealthy,
 )
+from requeue import requeue_orphaned_jobs
 
 from router import (
     processor_id_from_url,
@@ -65,11 +69,10 @@ async def health():
 
 async def refresh_processor_metrics(processor_urls: list[str]):
     """
-    Ask each processor for fresh metrics before routing.
-    Processor /metrics also writes those values to Redis with a short TTL.
+    Refresh metrics for all listed processors.
+    Enforces failure thresholds, marking unresponsive instances as unhealthy 
+    and asynchronously triggering job requeuing for dead processors.
     """
-    # The metrics request doubles as a liveness check; failed calls mark the
-    # processor stale so routing stops considering it for active traffic.
     async with httpx.AsyncClient(
         timeout=settings.metrics_refresh_timeout_seconds
     ) as client:
@@ -80,7 +83,14 @@ async def refresh_processor_metrics(processor_urls: list[str]):
                 response.raise_for_status()
                 mark_processor_metrics_seen(r, processor_id)
             except httpx.HTTPError:
-                mark_processor_stale(r, processor_id)
+                failed_polls = increment_processor_failed_polls(r, processor_id)
+                if failed_polls >= settings.max_failed_polls:
+                    mark_processor_unhealthy(r, processor_id)
+                    asyncio.create_task(
+                        requeue_orphaned_jobs(settings.redis_url, processor_id)
+                    )
+                else:
+                    mark_processor_stale(r, processor_id)
                 continue
 
 
@@ -295,7 +305,7 @@ async def get_best_processor():
     processor_urls = get_processor_urls(
         r,
         processor_type="local",
-        statuses={"active", "stale"},
+        statuses={"active", "stale", "unhealthy"},
     )
     await refresh_processor_metrics(processor_urls)
     processor_urls = get_processor_urls(
