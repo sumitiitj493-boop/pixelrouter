@@ -66,20 +66,41 @@ def fetch_jobs(r: redis.Redis) -> list[dict]:
             jobs.append(job_data)
     return jobs
 
+# Fetch live data
+processor_status_data = fetch_processor_status()
+scaling_status_data = fetch_scaling_status()
+
+processors = processor_status_data.get("processors", [])
+active_processors = sum(1 for p in processors if p.get("status") == "active")
+total_pending_jobs = sum(int(p.get("pending_jobs", 0)) for p in processors)
+
+live_cpus = [float(p.get("cpu_percent")) for p in processors if p.get("cpu_percent") not in ("unknown", None)]
+avg_cpu = sum(live_cpus) / len(live_cpus) if live_cpus else 0.0
+
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Active Processors", "2", delta="1 on GCP")
+    st.metric("Active Processors", f"{active_processors} / {scaling_status_data.get('max_processors', '?')}")
 with col2:
-    st.metric("Jobs in Queue", "—", delta=None)
+    st.metric("Jobs in Queue", str(total_pending_jobs))
 with col3:
-    st.metric("Avg CPU", "—", delta=None)
+    st.metric("Avg CPU", f"{avg_cpu:.1f}%")
 
-st.info("Dashboard implementation begins on Upcoming Days. "
-        "Infrastructure and services will be ready by then.")
+def get_status_emoji(status: str) -> str:
+    if status == "active":
+        return "🟢 Active"
+    elif status == "stale":
+        return "🟡 Stale"
+    elif status == "unhealthy":
+        return "🔴 Unhealthy"
+    return f"⚪ {status.capitalize()}"
 
 st.subheader("Processor Status")
-st.markdown("| Processor     | CPU % | Pending Jobs | Status     |")
-st.markdown("|---------------|-------|--------------|------------|")
-st.markdown("| processor-1   | —     | —            | Starting   |")
-st.markdown("| processor-2   | —     | —            | Starting   |")
-st.markdown("| GCP Cloud Run | —     | —            | Cloud      |")
+if processors:
+    # Build dynamic markdown table
+    md_table = "| Processor | CPU % | Pending Jobs | Status |\n|---|---|---|---|\n"
+    for p in processors:
+        status_display = get_status_emoji(p.get("status", "unknown"))
+        md_table += f"| {p.get('processor_id')} | {p.get('cpu_percent')}% | {p.get('pending_jobs')} | {status_display} |\n"
+    st.markdown(md_table)
+else:
+    st.info("No processors registered yet.")
