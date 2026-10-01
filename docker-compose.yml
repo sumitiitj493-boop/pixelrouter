@@ -8,13 +8,13 @@ services:
       - "8000:8000"
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL}
       - LOAD_BALANCER_URL=http://load-balancer:8001
-      - GCS_BUCKET_NAME=pixelrouter-images-sumit
+      - GCS_BUCKET_NAME=pixelrouter-images-sumit2
       - GCS_OBJECT_PREFIX=jobs
       - GCS_URL_STRATEGY=${GCS_URL_STRATEGY:-gcs_uri}
       - GCS_SIGNED_URL_TTL_SECONDS=${GCS_SIGNED_URL_TTL_SECONDS:-3600}
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+      - GOOGLE_CLOUD_PROJECT=project-8dc7e2d7-b16e-4d61-81f
     depends_on:
       redis:
         condition: service_healthy
@@ -32,6 +32,7 @@ services:
     volumes:
       - ./gcp-key.json:/app/gcp-key.json:ro
 
+
   load-balancer:
     build:
       context: ./load-balancer
@@ -40,8 +41,8 @@ services:
       - "8001:8001"
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
-      - PROCESSOR_URLS=http://processor-1:8002,http://processor-2:8003
+      - REDIS_URL=${REDIS_URL}
+      - PROCESSOR_URLS=http://processor-1:8002,http://processor-2:8003,${CLOUD_RUN_PROCESSOR_URL}
       - MAX_CPU_THRESHOLD=80
       - MAX_FAILED_POLLS=3
       - METRICS_REFRESH_TIMEOUT_SECONDS=2
@@ -66,6 +67,7 @@ services:
       retries: 3
       start_period: 15s
 
+
   processor-1:
     build:
       context: ./processor
@@ -75,11 +77,11 @@ services:
       - "8002:8002"
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL}
       - PROCESSOR_ID=processor-1
       - PORT=8002
-      - GCS_BUCKET_NAME=pixelrouter-images-sumit
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+      - GCS_BUCKET_NAME=pixelrouter-images-sumit2
+      - GOOGLE_CLOUD_PROJECT=project-8dc7e2d7-b16e-4d61-81f
     depends_on:
       redis:
         condition: service_healthy
@@ -95,6 +97,7 @@ services:
     volumes:
       - ./gcp-key.json:/app/gcp-key.json:ro
 
+
   processor-2:
     build:
       context: ./processor
@@ -104,11 +107,11 @@ services:
       - "8003:8003"
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL}
       - PROCESSOR_ID=processor-2
       - PORT=8003
-      - GCS_BUCKET_NAME=pixelrouter-images-sumit
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+      - GCS_BUCKET_NAME=pixelrouter-images-sumit2
+      - GOOGLE_CLOUD_PROJECT=project-8dc7e2d7-b16e-4d61-81f
     depends_on:
       redis:
         condition: service_healthy
@@ -124,6 +127,7 @@ services:
     volumes:
       - ./gcp-key.json:/app/gcp-key.json:ro
 
+
   dashboard:
     build:
       context: ./dashboard
@@ -132,13 +136,14 @@ services:
       - "8501:8501"
     env_file: .env
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       redis:
         condition: service_healthy
     networks:
       - pixelrouter-network
     restart: unless-stopped
+
 
   redis:
     image: redis:7-alpine
@@ -156,9 +161,11 @@ services:
       timeout: 5s
       retries: 3
 
+
 networks:
   pixelrouter-network:
     driver: bridge
+
 
 volumes:
   redis-data:
