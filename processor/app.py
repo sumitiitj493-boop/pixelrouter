@@ -118,7 +118,9 @@ async def save_result(job_id: str, result_bytes: bytes, caption: str) -> str:
     """
     png_path = f"results/{job_id}.png"
     json_path = f"results/{job_id}.json"
-
+    # Validate before attempting upload — catch corrupt pipeline output early
+    if not result_bytes:
+        raise ValueError(f"[{job_id}] result_bytes is empty — pipeline produced no output")
     # Upload the image first — if this fails, we don't want a metadata
     # file pointing at an image that was never written.
     result_url = await upload_bytes(png_path, result_bytes, "image/png")

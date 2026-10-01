@@ -647,3 +647,14 @@ def test_update_pending_count_increments_and_clamps_to_zero():
     assert incremented == 3
     assert decremented == 0
     assert redis_client.values["metrics:processor-1:pending"] == "0"
+
+
+# --- CLEANUP FOR PYTEST ---
+# Remove these global stubs from sys.modules so they don't pollute and crash subsequent tests (like test_processor.py)
+import sys
+if "fastapi" in sys.modules and getattr(sys.modules["fastapi"], "__name__", "") == "fastapi" and getattr(sys.modules["fastapi"], "__package__", None) is None:
+    del sys.modules["fastapi"]
+if "httpx" in sys.modules and getattr(sys.modules["httpx"], "__name__", "") == "httpx" and getattr(sys.modules["httpx"], "__package__", None) is None:
+    del sys.modules["httpx"]
+if "redis" in sys.modules and getattr(sys.modules["redis"], "__name__", "") == "redis" and getattr(sys.modules["redis"], "__package__", None) is None:
+    del sys.modules["redis"]
