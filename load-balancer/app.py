@@ -319,7 +319,7 @@ async def get_best_processor():
     processor_urls = get_processor_urls(
         r,
         processor_type="local",
-        statuses={"active"},
+        statuses={"active", "stale"},
     )
     live_processors = get_live_processor_metrics(processor_urls, r)
     route_decision = maybe_scale_or_fallback(live_processors, r)
