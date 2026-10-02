@@ -76,7 +76,7 @@ async def refresh_processor_metrics(processor_urls: list[str]):
     async with httpx.AsyncClient(
         timeout=settings.metrics_refresh_timeout_seconds
     ) as client:
-        for processor_url in processor_urls:
+        async def fetch_metric(processor_url: str):
             processor_id = processor_id_from_url(processor_url)
             try:
                 response = await client.get(f"{processor_url}/metrics")
@@ -91,7 +91,11 @@ async def refresh_processor_metrics(processor_urls: list[str]):
                     )
                 else:
                     mark_processor_stale(r, processor_id)
-                continue
+        
+        # Fetch all metrics concurrently to prevent 502 gateway timeouts!
+        tasks = [fetch_metric(url) for url in processor_urls]
+        import asyncio
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _parse_int(value, default: int = 0) -> int:
@@ -307,6 +311,10 @@ async def get_best_processor():
         processor_type="local",
         statuses={"active", "stale", "unhealthy"},
     )
+    cloud_urls = get_processor_urls(
+        r, processor_type="cloud", statuses={"active", "stale", "unhealthy"}
+    )
+    processor_urls.extend(cloud_urls)
     await refresh_processor_metrics(processor_urls)
     processor_urls = get_processor_urls(
         r,
