@@ -354,6 +354,7 @@ async def upload_image(file: UploadFile = File(...)):
         "gcs_bucket": gcs_metadata["bucket_name"],
         "gcs_object": gcs_metadata["object_name"],
         "gcs_path": gcs_metadata["gcs_path"],
+        "image_url": gcs_metadata["gcs_path"],
         "gcs_access_url": gcs_metadata["access_url"],
         "gcs_url_strategy": gcs_metadata["url_strategy"],
         "gcs_url_expires_at": gcs_metadata["url_expires_at"],

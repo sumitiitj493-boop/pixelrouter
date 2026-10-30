@@ -67,6 +67,12 @@ def generate_caption_sync(image_bytes: bytes) -> str:
     logger.info("Starting BLIP caption generation")
 
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if min(image.size) < 32:
+        scale = 32 / min(image.size)
+        image = image.resize(
+            (max(32, round(image.width * scale)), max(32, round(image.height * scale))),
+            Image.Resampling.BICUBIC,
+        )
 
     # Correct modern call (this was the main fix)
     inputs = blip_processor(images=image, return_tensors="pt")

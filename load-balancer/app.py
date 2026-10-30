@@ -361,6 +361,12 @@ async def processors_status():
     Reads from Redis metrics keys written by each processor.
     """
     ensure_processor_registry()
+    local_processor_urls = get_processor_urls(
+        r,
+        processor_type="local",
+        statuses={"active", "stale", "unhealthy"},
+    )
+    await refresh_processor_metrics(local_processor_urls)
     statuses = []
     for processor in get_processors(r):
         url = processor.get("url")

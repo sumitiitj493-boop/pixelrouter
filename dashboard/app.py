@@ -11,6 +11,7 @@
 # TODO: Implement manual routing override
 
 import os
+import time
 import httpx
 import redis
 import pandas as pd
@@ -25,8 +26,8 @@ st.set_page_config(
 st.title(" PixelRouter — Admin Dashboard")
 st.caption("Real-time monitoring for hybrid cloud image processing")
 
-# Configure page auto-refresh (2000ms interval) for live updates.
-st_autorefresh(interval=2000, limit=None, key="dashboard_autorefresh")
+# Refresh monitoring data every 10 seconds to avoid constant page reruns.
+st_autorefresh(interval=10000, limit=None, key="dashboard_autorefresh")
 
 LOAD_BALANCER_URL = os.getenv("LOAD_BALANCER_URL", "http://load-balancer:8001")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
@@ -38,24 +39,34 @@ def get_redis_client() -> redis.Redis:
 redis_client = get_redis_client()
 
 
+def fetch_load_balancer_data(path: str, label: str) -> dict:
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = httpx.get(f"{LOAD_BALANCER_URL}{path}", timeout=5.0)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.25)
+
+    st.error(f"Failed to fetch {label}: {last_error}")
+    return {}
+
+
 def fetch_processor_status() -> dict:
-    try:
-        response = httpx.get(f"{LOAD_BALANCER_URL}/processors/status", timeout=2.0)
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPError as exc:
-        st.error(f"Failed to fetch processor status: {exc}")
-        return {"processors": []}
+    return fetch_load_balancer_data(
+        "/processors/status",
+        "processor status",
+    )
 
 
 def fetch_scaling_status() -> dict:
-    try:
-        response = httpx.get(f"{LOAD_BALANCER_URL}/scaling/status", timeout=2.0)
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPError as exc:
-        st.error(f"Failed to fetch scaling status: {exc}")
-        return {}
+    return fetch_load_balancer_data(
+        "/scaling/status",
+        "scaling status",
+    )
 
 
 def fetch_jobs(r: redis.Redis) -> list[dict]:
@@ -73,19 +84,24 @@ processor_status_data = fetch_processor_status()
 scaling_status_data = fetch_scaling_status()
 
 processors = processor_status_data.get("processors", [])
-active_processors = sum(1 for p in processors if p.get("status") == "active")
+local_processors = [p for p in processors if p.get("type") == "local"]
+cloud_processors = [p for p in processors if p.get("type") == "cloud"]
+active_local_processors = sum(1 for p in local_processors if p.get("status") == "active")
+cloud_fallback_ready = any(p.get("status") == "active" for p in cloud_processors)
 total_pending_jobs = sum(int(p.get("pending_jobs", 0)) for p in processors)
 
-live_cpus = [float(p.get("cpu_percent")) for p in processors if p.get("cpu_percent") not in ("unknown", None)]
+live_cpus = [float(p.get("cpu_percent")) for p in local_processors if p.get("cpu_percent") not in ("unknown", None)]
 avg_cpu = sum(live_cpus) / len(live_cpus) if live_cpus else 0.0
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.metric("Active Processors", f"{active_processors} / {scaling_status_data.get('max_processors', '?')}")
+    st.metric("Local Processors", f"{active_local_processors} / {scaling_status_data.get('max_processors', '?')}")
 with col2:
-    st.metric("Jobs in Queue", str(total_pending_jobs))
+    st.metric("Cloud Fallback", "Ready" if cloud_fallback_ready else "Unavailable")
 with col3:
-    st.metric("Avg CPU", f"{avg_cpu:.1f}%")
+    st.metric("Jobs in Queue", str(total_pending_jobs))
+with col4:
+    st.metric("Avg Local CPU", f"{avg_cpu:.1f}%")
 
 def get_status_emoji(status: str) -> str:
     if status == "active":
@@ -97,9 +113,9 @@ def get_status_emoji(status: str) -> str:
     return f"⚪ {status.capitalize()}"
 
 st.subheader("CPU Utilization")
-if processors:
+if local_processors:
     # Enforce numeric types for Plotly to render the Y-axis correctly
-    df_processors = pd.DataFrame(processors)
+    df_processors = pd.DataFrame(local_processors)
     df_processors["cpu_percent"] = pd.to_numeric(df_processors["cpu_percent"], errors="coerce").fillna(0)
     
     fig = px.bar(
@@ -128,10 +144,10 @@ else:
 st.subheader("Processor Status")
 if processors:
     # Build dynamic markdown table
-    md_table = "| Processor | CPU % | Pending Jobs | Status |\n|---|---|---|---|\n"
+    md_table = "| Processor | Type | CPU % | Pending Jobs | Status |\n|---|---|---|---|---|\n"
     for p in processors:
         status_display = get_status_emoji(p.get("status", "unknown"))
-        md_table += f"| {p.get('processor_id')} | {p.get('cpu_percent')}% | {p.get('pending_jobs')} | {status_display} |\n"
+        md_table += f"| {p.get('processor_id')} | {p.get('type')} | {p.get('cpu_percent')}% | {p.get('pending_jobs')} | {status_display} |\n"
     st.markdown(md_table)
 else:
     st.info("No processors registered yet.")

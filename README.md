@@ -1,66 +1,94 @@
 # PixelRouter
 
-> Scalable Hybrid Cloud Image Processing Platform
+> Scalable hybrid-cloud image processing platform
 
-PixelRouter is a distributed image processing platform designed for high availability and elastic scaling. It accepts image uploads, routes workloads across a fleet of local and cloud processors, and executes AI-driven image tasks (background removal, captioning).
+PixelRouter is a distributed image processing system that accepts image uploads, routes jobs across local Docker processors, and falls back to Google Cloud Run when local capacity is exhausted. The processing pipeline uses `rembg` for background removal and Salesforce BLIP for image captioning.
 
 ## Architecture
 
-| Service | Port | Tech Stack |
-|---------|------|------------|
-| Upload Service | 8000 | FastAPI, Redis, GCS |
-| Load Balancer | 8001 | FastAPI, Redis, httpx, Docker SDK |
-| Processor (Local) | 8002+ | FastAPI, rembg, BLIP, psutil |
-| Processor (Cloud) | Cloud Run | GCP Cloud Run |
+![PixelRouter dashboard](docs/Image/dashboard-overview.png)
+
+| Service | Port | Technology |
+| --- | ---: | --- |
+| Upload service | 8000 | FastAPI, Redis, Google Cloud Storage |
+| Load balancer | 8001 | FastAPI, Redis, HTTPX, Docker SDK |
+| Local processors | 8002+ | FastAPI, rembg, BLIP, psutil |
+| Cloud processor | Cloud Run | Google Cloud Run |
 | Dashboard | 8501 | Streamlit, Plotly |
-| Redis | 6379 | State Management, Queueing, Metrics |
+| State store | 6379 | Redis |
 
-## Quick Start
+### Processing flow
 
-```bash
-cp .env.example .env          # Configure GCP credentials & environment
-make build                    # Build Docker images
-make up                       # Start local environment
+1. The upload service validates the image and stores it in Google Cloud Storage.
+2. The load balancer selects the least-loaded processor using queue depth and CPU usage.
+3. Redis stores the job record and processor queue.
+4. A processor removes the image background and generates a caption with BLIP.
+5. The processed image and job metadata are written back to Google Cloud Storage and Redis.
+6. Local processors scale from the Docker-managed pool up to the configured limit before cloud fallback is used.
+
+## Setup
+
+### Prerequisites
+
+- Docker Desktop with Docker Compose
+- A Google Cloud project and storage bucket
+- A Google Cloud service-account JSON key
+
+Copy the environment template:
+
+```powershell
+Copy-Item .env.example .env
 ```
-Access the dashboard at `http://localhost:8501`.
 
-## Key Features
+Place the service-account key in the project root:
 
-- **CPU-Aware Routing:** Distributes jobs dynamically based on live processor utilization (lowest pending jobs, then lowest CPU usage) to prevent bottlenecks.
-- **Fault Tolerance & Auto-Recovery:** 
-  - Actively polls processor health via `/metrics`. 
-  - Marks processors as `unhealthy` after `MAX_FAILED_POLLS` consecutive failures.
-  - Automatically and asynchronously requeues orphaned jobs from dead processors to healthy ones without blocking incoming traffic.
-  - Processors automatically recover to `active` status once they become responsive again.
-- **Hybrid Autoscaling:** Seamlessly scales up local Docker processors under heavy load, and falls back to GCP Cloud Run when local capacity reaches `MAX_PROCESSORS`.
-- **Robust Storage:** Securely uploads assets to Google Cloud Storage (GCS) using deterministic keys and short-lived signed URLs.
-- **Redis-Backed State:** Utilizes Redis for a centralized processor registry, atomic counter updates (`INCRBY`), job state management, and real-time metrics.
+```text
+gcp-key.json
+```
 
-## Configuration Highlights (Load Balancer)
+Update `.env` with the Google Cloud project, bucket, and Cloud Run processor settings. The Docker Compose configuration mounts the key into the containers.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `MAX_CPU_THRESHOLD` | `80` | CPU utilization threshold triggering overload protocols |
-| `MAX_PROCESSORS` | `5` | Maximum allowed local processor containers |
-| `MAX_FAILED_POLLS` | `3` | Consecutive failed health checks before a processor is marked unhealthy |
-| `CLOUD_RUN_PROCESSOR_URL` | empty | GCP Cloud Run endpoint for cloud fallback |
+## Run
 
-## Project Status
+Build the images:
 
-Under active development.
+```powershell
+docker compose build
+```
 
-- [x] Load balancer CPU-aware routing & Redis registry
-- [x] Docker SDK local autoscaling & Cloud fallback
-- [x] Upload service GCS integration & signed URLs
-- [x] Processor fault tolerance & asynchronous orphan requeuing
-- [ ] Processor image pipeline (rembg + BLIP)
-- [ ] Dashboard real-time monitoring
+Start the platform:
 
-## Testing
+```powershell
+docker compose up -d
+```
 
-Unit tests extensively mock the Docker SDK and Redis to validate routing, autoscaling, and requeue logic without requiring a container stack.
-```bash
-pip install -r requirements-dev.txt
-make test
-make smoke-test # Validates real processor registration against running containers
+Check service status:
+
+```powershell
+docker compose ps
+```
+
+Open the dashboard:
+
+```text
+http://localhost:8501
+```
+
+The API documentation is available at:
+
+```text
+http://localhost:8000/docs
+http://localhost:8001/docs
+```
+
+View logs:
+
+```powershell
+docker compose logs -f
+```
+
+Stop the platform:
+
+```powershell
+docker compose down
 ```

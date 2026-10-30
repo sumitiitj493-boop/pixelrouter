@@ -59,11 +59,19 @@ def bootstrap_processor_registry(
         )
 
     if cloud_processor_url:
+        cloud_processor_id = processor_id_from_url(cloud_processor_url)
         register_processor(
             redis_client,
-            processor_id=processor_id_from_url(cloud_processor_url),
+            processor_id=cloud_processor_id,
             url=cloud_processor_url,
             processor_type="cloud",
+        )
+        # A configured cloud fallback is available at startup until health
+        # polling proves otherwise.
+        redis_client.hset(
+            processor_key(cloud_processor_id),
+            "status",
+            "active",
         )
 
 
